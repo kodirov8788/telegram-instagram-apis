@@ -6,7 +6,7 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint",
+    "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },
@@ -15,7 +15,7 @@
     "clsx": "^2.1.1",
     "dotenv": "^16.4.5",
     "lucide-react": "^0.424.0",
-    "next": "14.2.35",
+    "next": "15.5.21",
     "openai": "^4.55.0",
     "pg": "^8.12.0",
     "react": "^18.3.1",
@@ -29,13 +29,14 @@
     "@types/react-dom": "^18.3.0",
     "autoprefixer": "^10.4.20",
     "eslint": "^8.57.0",
-    "eslint-config-next": "14.2.35",
+    "eslint-config-next": "15.5.21",
     "postcss": "^8.5.3",
     "tailwindcss": "^3.4.7",
     "typescript": "^5.5.4",
     "vitest": "^1.6.0"
   },
   "overrides": {
-    "postcss": "^8.5.3"
+    "postcss": "^8.5.3",
+    "sharp": "^0.35.0"
   }
 }
