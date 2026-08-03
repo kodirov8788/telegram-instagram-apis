@@ -14,3 +14,32 @@ export async function query(text: string, params?: any[]) {
   console.log('Executed query', { text, duration, rows: res.rowCount });
   return res;
 }
+
+export interface DbClient { query(text: string, params?: unknown[]): Promise<{ rows: any[]; rowCount?: number | null }>; }
+export async function identityTransaction<T>(userId: string, operation: (client: DbClient) => Promise<T>): Promise<T> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query("SELECT set_config('app.user_id', $1, true)", [userId]);
+    const value = await operation(client);
+    await client.query('COMMIT');
+    return value;
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally { client.release(); }
+}
+export async function tenantTransaction<T>(userId: string, operation: (client: DbClient) => Promise<T>): Promise<T> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('SET LOCAL ROLE ydeck_tenant_runtime_v2');
+    await client.query("SELECT set_config('app.user_id', $1, true)", [userId]);
+    const value = await operation(client);
+    await client.query('COMMIT');
+    return value;
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally { client.release(); }
+}

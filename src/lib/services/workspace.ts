@@ -1,4 +1,4 @@
-import pool, { query } from '../db';
+import { query, type DbClient } from '../db';
 
 export interface WorkspaceConfig {
   id?: string;
@@ -14,15 +14,9 @@ export interface WorkspaceConfig {
 }
 
 export class WorkspaceService {
-  static async createWorkspace(config: WorkspaceConfig, ownerUserId: string) {
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
-      
+  static async createWorkspace(config: WorkspaceConfig, client: DbClient) {
       const wsResult = await client.query(
-        `INSERT INTO workspaces (name, industry, time_zone, default_language, working_hours)
-         VALUES ($1, $2, $3, $4, $5)
-         RETURNING *`,
+        `SELECT * FROM bootstrap_workspace($1, $2, $3, $4, $5)`,
         [
           config.name,
           config.industry || 'general',
@@ -31,33 +25,16 @@ export class WorkspaceService {
           JSON.stringify(config.workingHours || { start: '09:00', end: '18:00', days: [1, 2, 3, 4, 5] })
         ]
       );
-      
-      const workspace = wsResult.rows[0];
-
-      // Assign Owner role
-      await client.query(
-        `INSERT INTO workspace_members (workspace_id, user_id, role)
-         VALUES ($1, $2, 'owner')`,
-        [workspace.id, ownerUserId]
-      );
-
-      await client.query('COMMIT');
-      return workspace;
-    } catch (error) {
-      await client.query('ROLLBACK');
-      throw error;
-    } finally {
-      client.release();
-    }
+      return wsResult.rows[0];
   }
 
-  static async getWorkspaceById(workspaceId: string) {
-    const res = await query(`SELECT * FROM workspaces WHERE id = $1`, [workspaceId]);
+  static async getWorkspaceById(workspaceId: string, client: DbClient = { query }) {
+    const res = await client.query(`SELECT * FROM workspaces WHERE id = $1`, [workspaceId]);
     return res.rows[0] || null;
   }
 
-  static async updateWorkspaceConfig(workspaceId: string, updates: Partial<WorkspaceConfig>) {
-    const res = await query(
+  static async updateWorkspaceConfig(workspaceId: string, updates: Partial<WorkspaceConfig>, client: DbClient = { query }) {
+    const res = await client.query(
       `UPDATE workspaces 
        SET name = COALESCE($1, name),
            industry = COALESCE($2, industry),
