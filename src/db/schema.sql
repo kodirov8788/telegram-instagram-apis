@@ -39,6 +39,27 @@ CREATE TABLE IF NOT EXISTS workspace_members (
     UNIQUE(workspace_id, user_id)
 );
 
+CREATE TABLE IF NOT EXISTS user_sessions (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    token_hash CHAR(64) UNIQUE NOT NULL,
+    expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    revoked_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS workspace_invitations (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    email VARCHAR(255) NOT NULL,
+    role user_role NOT NULL CHECK (role <> 'owner'),
+    token_hash CHAR(64) UNIQUE NOT NULL,
+    invited_by UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    accepted_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+
 -- 4. Channel Connections (Telegram & Instagram)
 CREATE TYPE channel_type AS ENUM ('telegram', 'instagram');
 
@@ -177,3 +198,34 @@ CREATE INDEX IF NOT EXISTS idx_conversations_workspace_status ON conversations(w
 CREATE INDEX IF NOT EXISTS idx_messages_conversation_id ON messages(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_leads_workspace_status ON leads(workspace_id, status);
 CREATE INDEX IF NOT EXISTS idx_knowledge_items_workspace ON knowledge_items(workspace_id);
+CREATE INDEX IF NOT EXISTS idx_user_sessions_user ON user_sessions(user_id);
+CREATE INDEX IF NOT EXISTS idx_workspace_invitations_workspace ON workspace_invitations(workspace_id);
+
+-- Supabase/PostgREST defense in depth. Direct clients cannot select another tenant.
+CREATE OR REPLACE FUNCTION current_user_is_workspace_member(target UUID)
+RETURNS BOOLEAN LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public AS $$
+  SELECT EXISTS (SELECT 1 FROM workspace_members WHERE workspace_id = target
+    AND user_id = NULLIF(current_setting('app.user_id', true), '')::uuid)
+$$;
+
+ALTER TABLE workspaces ENABLE ROW LEVEL SECURITY;
+ALTER TABLE workspace_members ENABLE ROW LEVEL SECURITY;
+ALTER TABLE workspace_invitations ENABLE ROW LEVEL SECURITY;
+ALTER TABLE channel_connections ENABLE ROW LEVEL SECURITY;
+ALTER TABLE customers ENABLE ROW LEVEL SECURITY;
+ALTER TABLE conversations ENABLE ROW LEVEL SECURITY;
+ALTER TABLE leads ENABLE ROW LEVEL SECURITY;
+ALTER TABLE knowledge_items ENABLE ROW LEVEL SECURITY;
+ALTER TABLE follow_up_rules ENABLE ROW LEVEL SECURITY;
+ALTER TABLE audit_logs ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY workspace_tenant_policy ON workspaces USING (current_user_is_workspace_member(id));
+CREATE POLICY member_tenant_policy ON workspace_members USING (current_user_is_workspace_member(workspace_id));
+CREATE POLICY invitation_tenant_policy ON workspace_invitations USING (current_user_is_workspace_member(workspace_id));
+CREATE POLICY channel_tenant_policy ON channel_connections USING (current_user_is_workspace_member(workspace_id));
+CREATE POLICY customer_tenant_policy ON customers USING (current_user_is_workspace_member(workspace_id));
+CREATE POLICY conversation_tenant_policy ON conversations USING (current_user_is_workspace_member(workspace_id));
+CREATE POLICY lead_tenant_policy ON leads USING (current_user_is_workspace_member(workspace_id));
+CREATE POLICY knowledge_tenant_policy ON knowledge_items USING (current_user_is_workspace_member(workspace_id));
+CREATE POLICY follow_up_tenant_policy ON follow_up_rules USING (current_user_is_workspace_member(workspace_id));
+CREATE POLICY audit_tenant_policy ON audit_logs USING (current_user_is_workspace_member(workspace_id));

@@ -1,46 +1,22 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { z } from 'zod';
 import { WorkspaceService } from '@/lib/services/workspace';
+import { authenticate, authorize } from '@/lib/auth/session';
+import { errorResponse, parseBody } from '@/lib/http/validation';
+
+const hours = z.object({ start: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/), end: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/), days: z.array(z.number().int().min(0).max(6)).min(1) }).strict();
+const createSchema = z.object({ name: z.string().trim().min(1).max(255), industry: z.string().trim().max(100).optional(), timeZone: z.string().trim().max(100).optional(), defaultLanguage: z.enum(['uz', 'ru', 'en']).optional(), workingHours: hours.optional() }).strict();
+const updateSchema = createSchema.partial().refine(v => Object.keys(v).length > 0);
 
 export async function GET(req: NextRequest) {
-  try {
-    const workspaceId = req.nextUrl.searchParams.get('id') || 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11';
-    const workspace = await WorkspaceService.getWorkspaceById(workspaceId);
-    return NextResponse.json({ workspace });
-  } catch (err: any) {
-    return NextResponse.json({ error: err.message }, { status: 500 });
-  }
+  try { const p = await authorize(req, 'workspace:read'); return NextResponse.json({ workspace: await WorkspaceService.getWorkspaceById(p.workspaceId) }); }
+  catch (error) { return errorResponse(error); }
 }
-
 export async function POST(req: NextRequest) {
-  try {
-    const body = await req.json();
-    const { name, industry, timeZone, defaultLanguage, workingHours, ownerUserId } = body;
-
-    const workspace = await WorkspaceService.createWorkspace(
-      { name, industry, timeZone, defaultLanguage, workingHours },
-      ownerUserId || '00000000-0000-0000-0000-000000000000'
-    );
-
-    return NextResponse.json({ workspace });
-  } catch (err: any) {
-    return NextResponse.json({ error: err.message }, { status: 500 });
-  }
+  try { const p = await authenticate(req); const body = await parseBody(req, createSchema); return NextResponse.json({ workspace: await WorkspaceService.createWorkspace(body, p.userId) }, { status: 201 }); }
+  catch (error) { return errorResponse(error); }
 }
-
 export async function PUT(req: NextRequest) {
-  try {
-    const body = await req.json();
-    const { id, name, industry, defaultLanguage, workingHours } = body;
-
-    const updated = await WorkspaceService.updateWorkspaceConfig(id, {
-      name,
-      industry,
-      defaultLanguage,
-      workingHours,
-    });
-
-    return NextResponse.json({ workspace: updated });
-  } catch (err: any) {
-    return NextResponse.json({ error: err.message }, { status: 500 });
-  }
+  try { const p = await authorize(req, 'workspace:update'); const body = await parseBody(req, updateSchema); return NextResponse.json({ workspace: await WorkspaceService.updateWorkspaceConfig(p.workspaceId, body) }); }
+  catch (error) { return errorResponse(error); }
 }
