@@ -13,27 +13,52 @@ DO $do$ BEGIN
 END $do$;
 CREATE UNIQUE INDEX IF NOT EXISTS workspace_invitations_one_live_email ON workspace_invitations(workspace_id, lower(email)) WHERE accepted_at IS NULL;
 DO $do$ BEGIN
- IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='customers_id_workspace_unique') THEN ALTER TABLE customers ADD CONSTRAINT customers_id_workspace_unique UNIQUE(id,workspace_id); END IF;
- IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='conversations_id_workspace_unique') THEN ALTER TABLE conversations ADD CONSTRAINT conversations_id_workspace_unique UNIQUE(id,workspace_id); END IF;
- IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='conversations_customer_tenant_fk') THEN ALTER TABLE conversations ADD CONSTRAINT conversations_customer_tenant_fk FOREIGN KEY(customer_id,workspace_id) REFERENCES customers(id,workspace_id) NOT VALID; END IF;
- IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='leads_customer_tenant_fk') THEN ALTER TABLE leads ADD CONSTRAINT leads_customer_tenant_fk FOREIGN KEY(customer_id,workspace_id) REFERENCES customers(id,workspace_id) NOT VALID; END IF;
- IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='leads_conversation_tenant_fk') THEN ALTER TABLE leads ADD CONSTRAINT leads_conversation_tenant_fk FOREIGN KEY(conversation_id,workspace_id) REFERENCES conversations(id,workspace_id) NOT VALID; END IF;
+ IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='customers_id_workspace_unique' AND conrelid='public.customers'::regclass) THEN ALTER TABLE customers ADD CONSTRAINT customers_id_workspace_unique UNIQUE(id,workspace_id); END IF;
+ IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='conversations_id_workspace_unique' AND conrelid='public.conversations'::regclass) THEN ALTER TABLE conversations ADD CONSTRAINT conversations_id_workspace_unique UNIQUE(id,workspace_id); END IF;
+ IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='conversations_customer_tenant_fk' AND conrelid='public.conversations'::regclass) THEN ALTER TABLE conversations ADD CONSTRAINT conversations_customer_tenant_fk FOREIGN KEY(customer_id,workspace_id) REFERENCES customers(id,workspace_id) NOT VALID; END IF;
+ IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='leads_customer_tenant_fk' AND conrelid='public.leads'::regclass) THEN ALTER TABLE leads ADD CONSTRAINT leads_customer_tenant_fk FOREIGN KEY(customer_id,workspace_id) REFERENCES customers(id,workspace_id) NOT VALID; END IF;
+ IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='leads_conversation_tenant_fk' AND conrelid='public.leads'::regclass) THEN ALTER TABLE leads ADD CONSTRAINT leads_conversation_tenant_fk FOREIGN KEY(conversation_id,workspace_id) REFERENCES conversations(id,workspace_id) NOT VALID; END IF;
 END $do$;
 ALTER TABLE conversations VALIDATE CONSTRAINT conversations_customer_tenant_fk;
 ALTER TABLE leads VALIDATE CONSTRAINT leads_customer_tenant_fk;
 ALTER TABLE leads VALIDATE CONSTRAINT leads_conversation_tenant_fk;
 
-DO $do$ BEGIN IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='ydeck_tenant_runtime_v2') THEN CREATE ROLE ydeck_tenant_runtime_v2 NOLOGIN NOINHERIT; END IF; END $do$;
-ALTER ROLE ydeck_tenant_runtime_v2 NOLOGIN NOINHERIT;
+DO $do$ BEGIN IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='ydeck_tenant_runtime_v2') THEN CREATE ROLE ydeck_tenant_runtime_v2 NOLOGIN NOINHERIT NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION; END IF; END $do$;
+DO $do$ BEGIN IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname='ydeck_tenant_runtime_v2' AND (rolcanlogin OR rolinherit OR rolsuper OR rolbypassrls OR rolcreatedb OR rolcreaterole OR rolreplication)) THEN RAISE EXCEPTION 'unsafe attributes on ydeck_tenant_runtime_v2'; END IF; END $do$;
 GRANT ydeck_tenant_runtime_v2 TO CURRENT_USER;
 CREATE OR REPLACE FUNCTION current_user_is_workspace_member(target UUID) RETURNS BOOLEAN LANGUAGE sql STABLE SECURITY DEFINER SET search_path=pg_catalog,public AS $$ SELECT EXISTS(SELECT 1 FROM public.workspace_members WHERE workspace_id=target AND user_id=NULLIF(current_setting('app.user_id',true),'')::uuid) $$;
 REVOKE ALL ON FUNCTION current_user_is_workspace_member(UUID) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION current_user_is_workspace_member(UUID) TO ydeck_tenant_runtime_v2;
 GRANT SELECT,INSERT,UPDATE,DELETE ON workspaces,workspace_members,workspace_invitations,channel_connections,customers,conversations,messages,leads,knowledge_items,follow_up_rules,audit_logs TO ydeck_tenant_runtime_v2;
+CREATE OR REPLACE FUNCTION bootstrap_workspace(p_name TEXT, p_industry TEXT, p_time_zone TEXT, p_default_language TEXT, p_working_hours JSONB)
+RETURNS SETOF public.workspaces LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,public AS $fn$
+DECLARE actor UUID; created public.workspaces%ROWTYPE;
+BEGIN
+ actor := NULLIF(current_setting('app.user_id',true),'')::UUID;
+ IF actor IS NULL OR NOT EXISTS(SELECT 1 FROM public.users WHERE id=actor) THEN RAISE EXCEPTION 'authenticated identity required' USING ERRCODE='28000'; END IF;
+ INSERT INTO public.workspaces(name,industry,time_zone,default_language,working_hours) VALUES(p_name,p_industry,p_time_zone,p_default_language,p_working_hours) RETURNING * INTO created;
+ INSERT INTO public.workspace_members(workspace_id,user_id,role) VALUES(created.id,actor,'owner');
+ RETURN NEXT created;
+END $fn$;
+CREATE OR REPLACE FUNCTION accept_workspace_invitation(p_token_hash TEXT)
+RETURNS TABLE(workspace_id UUID, role user_role) LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,public AS $fn$
+DECLARE actor UUID; invite_id UUID; invite_workspace UUID; invite_role user_role; inserted UUID;
+BEGIN
+ actor := NULLIF(current_setting('app.user_id',true),'')::UUID;
+ IF actor IS NULL THEN RAISE EXCEPTION 'authenticated identity required' USING ERRCODE='28000'; END IF;
+ SELECT i.id,i.workspace_id,i.role INTO invite_id,invite_workspace,invite_role FROM public.workspace_invitations i JOIN public.users u ON u.id=actor AND lower(u.email)=lower(i.email) WHERE i.token_hash=p_token_hash AND i.accepted_at IS NULL AND i.expires_at>NOW() FOR UPDATE OF i;
+ IF NOT FOUND THEN RETURN; END IF;
+ INSERT INTO public.workspace_members(workspace_id,user_id,role) VALUES(invite_workspace,actor,invite_role) ON CONFLICT ON CONSTRAINT workspace_members_pkey DO NOTHING RETURNING user_id INTO inserted;
+ IF inserted IS NULL THEN RETURN; END IF;
+ UPDATE public.workspace_invitations SET accepted_at=NOW() WHERE id=invite_id;
+ workspace_id:=invite_workspace; role:=invite_role; RETURN NEXT;
+END $fn$;
+REVOKE ALL ON FUNCTION bootstrap_workspace(TEXT,TEXT,TEXT,TEXT,JSONB) FROM PUBLIC;
+REVOKE ALL ON FUNCTION accept_workspace_invitation(TEXT) FROM PUBLIC;
 DO $do$ DECLARE t text; BEGIN FOREACH t IN ARRAY ARRAY['workspaces','workspace_members','workspace_invitations','channel_connections','customers','conversations','messages','leads','knowledge_items','follow_up_rules','audit_logs'] LOOP EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY',t); END LOOP; END $do$;
--- The SECURITY DEFINER membership function is owned by the migration/table owner and must
--- bypass workspace_members RLS to avoid recursively invoking member_tenant_policy.
-DO $do$ DECLARE t text; BEGIN FOREACH t IN ARRAY ARRAY['workspaces','workspace_invitations','channel_connections','customers','conversations','messages','leads','knowledge_items','follow_up_rules','audit_logs'] LOOP EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY',t); END LOOP; END $do$;
+-- Bootstrap SECURITY DEFINER functions and the membership predicate must owner-bypass
+-- these three tables; the non-owner runtime role remains subject to their enabled RLS.
+DO $do$ DECLARE t text; BEGIN FOREACH t IN ARRAY ARRAY['channel_connections','customers','conversations','messages','leads','knowledge_items','follow_up_rules','audit_logs'] LOOP EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY',t); END LOOP; END $do$;
 DO $do$ DECLARE p text; t text; c text; BEGIN FOR p,t,c IN SELECT * FROM (VALUES ('workspace_tenant_policy','workspaces','id'),('member_tenant_policy','workspace_members','workspace_id'),('invitation_tenant_policy','workspace_invitations','workspace_id'),('channel_tenant_policy','channel_connections','workspace_id'),('customer_tenant_policy','customers','workspace_id'),('conversation_tenant_policy','conversations','workspace_id'),('lead_tenant_policy','leads','workspace_id'),('knowledge_tenant_policy','knowledge_items','workspace_id'),('follow_up_tenant_policy','follow_up_rules','workspace_id'),('audit_tenant_policy','audit_logs','workspace_id')) x LOOP IF NOT EXISTS(SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename=t AND policyname=p) THEN EXECUTE format('CREATE POLICY %I ON %I USING (current_user_is_workspace_member(%I)) WITH CHECK (current_user_is_workspace_member(%I))',p,t,c,c); END IF; END LOOP; END $do$;
 DO $do$ BEGIN IF NOT EXISTS(SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='messages' AND policyname='message_tenant_policy') THEN CREATE POLICY message_tenant_policy ON messages USING (EXISTS(SELECT 1 FROM public.conversations c WHERE c.id=conversation_id AND public.current_user_is_workspace_member(c.workspace_id))) WITH CHECK (EXISTS(SELECT 1 FROM public.conversations c WHERE c.id=conversation_id AND public.current_user_is_workspace_member(c.workspace_id))); END IF; END $do$;
 COMMIT;

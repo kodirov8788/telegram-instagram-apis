@@ -4,24 +4,26 @@ import { NextRequest } from 'next/server';
 const client = { query: vi.fn(), release: vi.fn() };
 vi.mock('@/lib/db', () => ({
   query: vi.fn(),
+  identityTransaction: vi.fn(),
   tenantTransaction: vi.fn(),
   default: { connect: vi.fn(async () => client) },
 }));
 vi.mock('bcryptjs', () => ({ hash: vi.fn(async () => 'hashed') }));
-import pool, { query, tenantTransaction } from '@/lib/db';
+import pool, { identityTransaction, query, tenantTransaction } from '@/lib/db';
 import { POST as register } from '../auth/register/route';
 import { POST as invite } from '../workspace/invitations/route';
 import { POST as accept } from '../invitations/accept/route';
 import { GET as exportLeads } from '../leads/export/route';
 
 const db = vi.mocked(query);
+const identity = vi.mocked(identityTransaction);
 const tenant = vi.mocked(tenantTransaction);
 const wid = '11111111-1111-4111-8111-111111111111';
 const uid = '22222222-2222-4222-8222-222222222222';
 const headers = { cookie: `session=${'a'.repeat(64)}`, 'x-workspace-id': wid, 'content-type': 'application/json' };
 const request = (url: string, body?: object) => new NextRequest(url, { method: body ? 'POST' : 'GET', headers, ...(body ? { body: JSON.stringify(body) } : {}) });
 
-beforeEach(() => { vi.clearAllMocks(); db.mockReset(); tenant.mockReset(); client.query.mockReset(); });
+beforeEach(() => { vi.clearAllMocks(); db.mockReset(); identity.mockReset(); tenant.mockReset(); client.query.mockReset(); });
 
 describe('registration atomicity', () => {
   it('commits user and session in the same transaction', async () => {
@@ -52,11 +54,13 @@ describe('invitation safety', () => {
   });
   it('acceptance is insert-only and returns a generic error on existing membership', async () => {
     db.mockResolvedValueOnce({ rows: [{ user_id: uid, email: 'user@test.dev' }] } as never);
-    client.query.mockResolvedValueOnce({}).mockResolvedValueOnce({ rows: [{ id: 'i1', workspace_id: wid, role: 'admin' }] }).mockResolvedValueOnce({ rows: [] }).mockResolvedValueOnce({});
+    identity.mockImplementationOnce(async (_userId, operation) => operation(client as never));
+    client.query.mockResolvedValueOnce({ rows: [] });
     const res = await accept(request('https://app.test/api/invitations/accept', { token: 'b'.repeat(64) }));
     expect(res.status).toBe(404);
+    expect(identity).toHaveBeenCalledWith(uid, expect.any(Function));
+    expect(client.query).toHaveBeenCalledWith('SELECT * FROM accept_workspace_invitation($1)', [expect.any(String)]);
     expect(client.query.mock.calls.some(c => String(c[0]).includes('DO UPDATE'))).toBe(false);
-    expect(client.query).toHaveBeenLastCalledWith('ROLLBACK');
   });
 });
 

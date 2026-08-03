@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
 import { WorkspaceService } from '@/lib/services/workspace';
 import { authenticate, withLiveAuthorization } from '@/lib/auth/session';
+import { identityTransaction } from '@/lib/db';
 import { errorResponse, parseBody } from '@/lib/http/validation';
 
 const hours = z.object({ start: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/), end: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/), days: z.array(z.number().int().min(0).max(6)).min(1) }).strict();
@@ -13,7 +14,7 @@ export async function GET(req: NextRequest) {
   catch (error) { return errorResponse(error); }
 }
 export async function POST(req: NextRequest) {
-  try { const p = await authenticate(req); const body = await parseBody(req, createSchema); return NextResponse.json({ workspace: await WorkspaceService.createWorkspace(body, p.userId) }, { status: 201 }); }
+  try { const p = await authenticate(req); const body = await parseBody(req, createSchema); return NextResponse.json({ workspace: await identityTransaction(p.userId, client => WorkspaceService.createWorkspace(body, client)) }, { status: 201 }); }
   catch (error) { return errorResponse(error); }
 }
 export async function PUT(req: NextRequest) {

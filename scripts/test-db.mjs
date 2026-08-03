@@ -52,10 +52,32 @@ try {
   await db.query(migration); // idempotency
   await db.query('RESET ROLE');
 
-  const ids = { u1: randomUUID(), u2: randomUUID(), w1: randomUUID(), w2: randomUUID(), c1: randomUUID(), c2: randomUUID(), v1: randomUUID(), v2: randomUUID() };
-  await db.query("INSERT INTO users(id,email,full_name) VALUES($1,'one@test.invalid','One'),($2,'two@test.invalid','Two')", [ids.u1,ids.u2]);
-  await db.query("INSERT INTO workspaces(id,name) VALUES($1,'One'),($2,'Two')", [ids.w1,ids.w2]);
-  await db.query("INSERT INTO workspace_members(workspace_id,user_id,role) VALUES($1,$2,'owner'),($3,$4,'owner')", [ids.w1,ids.u1,ids.w2,ids.u2]);
+  const attrs = (await db.query('SELECT rolcanlogin,rolinherit,rolsuper,rolbypassrls,rolcreatedb,rolcreaterole,rolreplication FROM pg_roles WHERE rolname=$1', [runtimeRole])).rows[0];
+  if (!attrs || attrs.rolcanlogin || attrs.rolinherit || attrs.rolsuper || attrs.rolbypassrls || attrs.rolcreatedb || attrs.rolcreaterole || attrs.rolreplication) throw new Error('runtime role retained dangerous attributes');
+
+  const ids = { u1: randomUUID(), u2: randomUUID(), u3: randomUUID(), w1: '', w2: randomUUID(), c1: randomUUID(), c2: randomUUID(), v1: randomUUID(), v2: randomUUID() };
+  await db.query("INSERT INTO users(id,email,full_name) VALUES($1,'one@test.invalid','One'),($2,'two@test.invalid','Two'),($3,'invitee@test.invalid','Invitee')", [ids.u1,ids.u2,ids.u3]);
+  await db.query(`SET ROLE ${qi(login)}`);
+  await db.query('BEGIN'); await db.query("SELECT set_config('app.user_id',$1,true)", [ids.u1]);
+  const bootstrapped = await db.query("SELECT id FROM bootstrap_workspace('One','general','UTC','en',$1::jsonb)", [JSON.stringify({ start: '09:00', end: '18:00', days: [1,2,3,4,5] })]);
+  ids.w1 = bootstrapped.rows[0]?.id;
+  if (!ids.w1) throw new Error('workspace bootstrap returned no workspace');
+  await db.query('COMMIT'); await db.query('RESET ROLE');
+  await db.query("INSERT INTO workspaces(id,name) VALUES($1,'Two')", [ids.w2]);
+  await db.query("INSERT INTO workspace_members(workspace_id,user_id,role) VALUES($1,$2,'owner')", [ids.w2,ids.u2]);
+  await expectCount(db, `SELECT count(*) FROM workspace_members WHERE workspace_id='${ids.w1}' AND user_id='${ids.u1}' AND role='owner'`, 1, 'workspace bootstrap owner membership');
+
+  const invitationHash = 'a'.repeat(64);
+  await db.query("INSERT INTO workspace_invitations(workspace_id,email,role,token_hash,invited_by,expires_at) VALUES($1,'invitee@test.invalid','support_operator',$2,$3,NOW()+INTERVAL '1 hour')", [ids.w1,invitationHash,ids.u1]);
+  await db.query(`SET ROLE ${qi(login)}`);
+  await db.query('BEGIN'); await db.query("SELECT set_config('app.user_id',$1,true)", [ids.u3]);
+  const accepted = await db.query('SELECT * FROM accept_workspace_invitation($1)', [invitationHash]);
+  if (accepted.rowCount !== 1 || accepted.rows[0].workspace_id !== ids.w1 || accepted.rows[0].role !== 'support_operator') throw new Error('valid invitation was not accepted');
+  await db.query('COMMIT');
+  await db.query('BEGIN'); await db.query("SELECT set_config('app.user_id',$1,true)", [ids.u3]);
+  const replay = await db.query('SELECT * FROM accept_workspace_invitation($1)', [invitationHash]);
+  if (replay.rowCount !== 0) throw new Error('accepted invitation replay was not rejected');
+  await db.query('ROLLBACK'); await db.query('RESET ROLE');
   await db.query("INSERT INTO customers(id,workspace_id,full_name) VALUES($1,$2,'One'),($3,$4,'Two')", [ids.c1,ids.w1,ids.c2,ids.w2]);
   await db.query("INSERT INTO conversations(id,workspace_id,customer_id,channel) VALUES($1,$2,$3,'telegram'),($4,$5,$6,'telegram')", [ids.v1,ids.w1,ids.c1,ids.v2,ids.w2,ids.c2]);
   await db.query("INSERT INTO messages(conversation_id,sender,content) VALUES($1,'customer','one'),($2,'customer','two')", [ids.v1,ids.v2]);

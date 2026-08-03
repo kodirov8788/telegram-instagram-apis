@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { NextRequest } from 'next/server';
-vi.mock('@/lib/db', () => ({ query: vi.fn(), tenantTransaction: vi.fn(async (_userId: string, operation: (client: { query: typeof query }) => unknown) => operation({ query })), default: { connect: vi.fn() } }));
+vi.mock('@/lib/db', () => ({ query: vi.fn(), identityTransaction: vi.fn(async (_userId: string, operation: (client: { query: typeof query }) => unknown) => operation({ query })), tenantTransaction: vi.fn(async (_userId: string, operation: (client: { query: typeof query }) => unknown) => operation({ query })), default: { connect: vi.fn() } }));
 vi.mock('@/lib/services/workspace', () => ({ WorkspaceService: { createWorkspace: vi.fn(), getWorkspaceById: vi.fn(), updateWorkspaceConfig: vi.fn() } }));
 import { query } from '@/lib/db';
 import { WorkspaceService } from '@/lib/services/workspace';
@@ -19,7 +19,7 @@ describe('tenant route enforcement', () => {
     session(); ws.createWorkspace.mockResolvedValue({ id: wid, name: 'Acme' } as never);
     const req = new NextRequest('https://app.test/api/workspace', { method: 'POST', headers, body: JSON.stringify({ name: 'Acme' }) });
     expect((await createWorkspace(req)).status).toBe(201);
-    expect(ws.createWorkspace).toHaveBeenCalledWith(expect.objectContaining({ name: 'Acme' }), 'user-1');
+    expect(ws.createWorkspace).toHaveBeenCalledWith(expect.objectContaining({ name: 'Acme' }), expect.objectContaining({ query: db }));
   });
   it('rejects a body-supplied owner id', async () => {
     session(); const req = new NextRequest('https://app.test/api/workspace', { method: 'POST', headers, body: JSON.stringify({ name: 'Acme', ownerUserId: 'attacker' }) });
