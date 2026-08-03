@@ -49,11 +49,11 @@ The project includes quality gate commands for build, test, lint, and type safet
   ```
 - **Dependency Audit**:
   ```bash
-  npm audit --omit=dev
+  npm audit --audit-level=high
   ```
 
 ### Dependency Audit Notes
-Next.js dependencies are pinned to `14.2.35` (the latest security-patched release in the Next.js 14 release line) to preserve framework compatibility without introducing breaking major upgrades. PostCSS and sub-dependencies are overridden to `>=8.5.3`.
+Next.js and `eslint-config-next` are pinned to `15.5.21`. Vitest is pinned to `4.1.10`, and the PostCSS and Sharp overrides keep transitive dependencies on patched releases. The committed lockfile and full dependency audit cover both runtime and development tooling.
 
 ## Continuous Integration
 GitHub Actions automatically runs all quality gates (`npm ci`, `npm run lint`, `npm run typecheck`, `npm test`, `npm run build`, `npm audit`) on every push and pull request.
