@@ -5,7 +5,7 @@ Unified messaging API service and dashboard for managing Telegram and Instagram 
 ## Local Setup & Development
 
 ### Prerequisites
-- Node.js v20+
+- Node.js `^20.19.0` or `>=22.12.0`
 - npm v10+
 - PostgreSQL database (optional for local mock testing)
 

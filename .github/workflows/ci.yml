@@ -3,7 +3,6 @@ name: CI Quality Gates
 on:
   push:
   pull_request:
-    branches: [ master, main ]
 
 jobs:
   quality-gates:
