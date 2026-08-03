@@ -62,8 +62,13 @@ describe('invitation safety', () => {
 
 describe('CSV formula defense', () => {
   it.each(['=x', '+x', '-x', '@x', '\tx', '\rx', '\nx', ' \n\t=x', '\u0000  +x'])('neutralizes %j after all leading controls/whitespace', async value => {
-    db.mockResolvedValueOnce({ rows: [{ user_id: uid, email: 'user@test.dev' }] } as never).mockResolvedValueOnce({ rows: [{ role: 'read_only_analyst' }] } as never);
-    tenant.mockImplementationOnce(async (_u, fn) => fn({ query: vi.fn(async () => ({ rows: [{ id: '1', full_name: value }] })) } as never));
+    db.mockResolvedValueOnce({ rows: [{ user_id: uid, email: 'user@test.dev' }] } as never);
+    tenant.mockImplementationOnce(async (_u, fn) => {
+      const clientQuery = vi.fn()
+        .mockResolvedValueOnce({ rows: [{ role: 'read_only_analyst' }] })
+        .mockResolvedValueOnce({ rows: [{ id: '1', full_name: value }] });
+      return fn({ query: clientQuery } as never);
+    });
     const text = await (await exportLeads(request(`https://app.test/api/leads/export?workspace_id=${wid}`))).text();
     expect(text).toContain(`'${value}`);
   });

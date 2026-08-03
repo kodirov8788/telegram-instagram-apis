@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto';
 import type { NextRequest } from 'next/server';
-import { query, type DbClient } from '@/lib/db';
+import { query, tenantTransaction, type DbClient } from '@/lib/db';
 import { can, type Permission, type Role } from './permissions';
 import { HttpError, uuid } from '../http/validation';
 
@@ -18,10 +18,10 @@ export async function createSession(userId: string, client: DbClient = { query }
   return { token, expiresAt };
 }
 
-export async function authenticate(request: NextRequest): Promise<Principal> {
+export async function authenticate(request: NextRequest, client: DbClient = { query }): Promise<Principal> {
   const token = request.cookies.get(SESSION_COOKIE)?.value;
   if (!token) throw new HttpError(401, 'Authentication required');
-  const result = await query(
+  const result = await client.query(
     `SELECT s.user_id, u.email FROM user_sessions s JOIN users u ON u.id = s.user_id
      WHERE s.token_hash = $1 AND s.revoked_at IS NULL AND s.expires_at > NOW()`, [hash(token)]);
   const row = result.rows[0];
@@ -43,6 +43,25 @@ export async function authorize(request: NextRequest, permission: Permission): P
   const role = result.rows[0]?.role as Role | undefined;
   if (!role || !can(role, permission)) throw new HttpError(403, 'Forbidden');
   return { ...principal, workspaceId, role };
+}
+
+/** Authorize from a locked, live membership row and execute on that same RLS connection. */
+export async function withLiveAuthorization<T>(
+  request: NextRequest,
+  permission: Permission,
+  operation: (principal: WorkspacePrincipal, client: DbClient) => Promise<T>,
+): Promise<T> {
+  const principal = await authenticate(request);
+  const workspaceId = selectedWorkspace(request);
+  return tenantTransaction(principal.userId, async client => {
+    const result = await client.query(
+      'SELECT role FROM public.workspace_members WHERE workspace_id = $1 AND user_id = $2 FOR SHARE',
+      [workspaceId, principal.userId],
+    );
+    const role = result.rows[0]?.role as Role | undefined;
+    if (!role || !can(role, permission)) throw new HttpError(403, 'Forbidden');
+    return operation({ ...principal, workspaceId, role }, client);
+  });
 }
 
 export async function revokeSession(request: NextRequest) {

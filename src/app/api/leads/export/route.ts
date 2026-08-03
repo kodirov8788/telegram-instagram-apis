@@ -1,6 +1,5 @@
 import { NextRequest } from 'next/server';
-import { tenantTransaction } from '@/lib/db';
-import { authorize } from '@/lib/auth/session';
+import { withLiveAuthorization } from '@/lib/auth/session';
 import { errorResponse } from '@/lib/http/validation';
 
 const csv = (value: unknown) => {
@@ -10,8 +9,7 @@ const csv = (value: unknown) => {
 };
 export async function GET(req: NextRequest) {
   try {
-    const p = await authorize(req, 'leads:export');
-    const res = await tenantTransaction(p.userId, client => client.query(`SELECT l.id, cust.full_name, cust.phone_number, cust.email, cust.telegram_username, cust.instagram_username,
+    const res = await withLiveAuthorization(req, 'leads:export', (p, client) => client.query(`SELECT l.id, cust.full_name, cust.phone_number, cust.email, cust.telegram_username, cust.instagram_username,
       l.requested_product_or_service, l.budget, l.timeline, l.status, l.score, l.created_at
       FROM leads l JOIN customers cust ON l.customer_id = cust.id WHERE l.workspace_id = $1 ORDER BY l.created_at DESC`, [p.workspaceId]));
     const headers = ['Lead ID','Full Name','Phone','Email','Telegram','Instagram','Product/Service','Budget','Timeline','Status','Score','Created At'];

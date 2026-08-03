@@ -43,6 +43,11 @@ The project includes quality gate commands for build, test, lint, and type safet
   ```bash
   npm test
   ```
+- **Opt-in PostgreSQL/RLS integration test** (creates and deletes only a randomly
+  named `ydeck_test_*` database; never reads `DATABASE_URL`):
+  ```bash
+  TEST_DATABASE_ADMIN_URL='postgresql://…/postgres' npm run test:db
+  ```
 - **Production Build**:
   ```bash
   npm run build
@@ -57,3 +62,14 @@ Next.js and `eslint-config-next` are pinned to `15.5.21`. Vitest is pinned to `4
 
 ## Continuous Integration
 GitHub Actions automatically runs all quality gates (`npm ci`, `npm run lint`, `npm run typecheck`, `npm test`, `npm run build`, `npm audit`) on every push and pull request.
+
+## Database deployment
+
+Apply `src/db/schema.sql` for fresh databases, or apply
+`src/db/migrations/002_auth_rbac_rls.sql` to the baseline schema, using the same
+login configured in `DATABASE_URL`. The migration creates the fixed
+`ydeck_tenant_runtime` role as `NOLOGIN NOINHERIT` and grants that role to the
+current migration login so runtime `SET LOCAL ROLE` works. The migration login
+therefore needs `CREATEROLE` when the role does not exist; if the role is
+pre-provisioned, it needs admin option on that role. Do not give the runtime
+role a password, `LOGIN`, `INHERIT`, `BYPASSRLS`, or table ownership.

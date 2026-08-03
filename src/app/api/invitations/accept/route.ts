@@ -8,7 +8,7 @@ const schema = z.object({ token: z.string().regex(/^[a-f0-9]{64}$/) }).strict();
 export async function POST(req: NextRequest) {
   let client;
   try {
-    const p = await authenticate(req); const body = await parseBody(req, schema); client = await pool.connect(); await client.query('BEGIN');
+    const body = await parseBody(req, schema); client = await pool.connect(); await client.query('BEGIN'); const p = await authenticate(req, client);
     const invite = (await client.query(`SELECT i.* FROM workspace_invitations i WHERE i.token_hash=$1 AND lower(i.email)=lower($2)
       AND i.accepted_at IS NULL AND i.expires_at>NOW() FOR UPDATE`, [createHash('sha256').update(body.token).digest('hex'), p.email])).rows[0];
     if (!invite) throw new HttpError(404, 'Invitation unavailable');
