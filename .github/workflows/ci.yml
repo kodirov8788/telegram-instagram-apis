@@ -2,7 +2,6 @@ name: CI Quality Gates
 
 on:
   push:
-    branches: [ master, main, 'fix/*' ]
   pull_request:
     branches: [ master, main ]
 
