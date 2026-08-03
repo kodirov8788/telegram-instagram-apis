@@ -242,10 +242,12 @@ DO $$ BEGIN
  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='leads_customer_tenant_fk') THEN ALTER TABLE leads ADD CONSTRAINT leads_customer_tenant_fk FOREIGN KEY(customer_id,workspace_id) REFERENCES customers(id,workspace_id); END IF;
  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='leads_conversation_tenant_fk') THEN ALTER TABLE leads ADD CONSTRAINT leads_conversation_tenant_fk FOREIGN KEY(conversation_id,workspace_id) REFERENCES conversations(id,workspace_id); END IF;
 END $$;
-DO $$ BEGIN IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='ydeck_tenant_runtime') THEN CREATE ROLE ydeck_tenant_runtime NOLOGIN NOINHERIT; END IF; END $$;
-ALTER ROLE ydeck_tenant_runtime NOLOGIN NOINHERIT;
-GRANT ydeck_tenant_runtime TO CURRENT_USER;
+DO $$ BEGIN IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='ydeck_tenant_runtime_v2') THEN CREATE ROLE ydeck_tenant_runtime_v2 NOLOGIN NOINHERIT; END IF; END $$;
+ALTER ROLE ydeck_tenant_runtime_v2 NOLOGIN NOINHERIT;
+GRANT ydeck_tenant_runtime_v2 TO CURRENT_USER;
 REVOKE ALL ON FUNCTION current_user_is_workspace_member(UUID) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION current_user_is_workspace_member(UUID) TO ydeck_tenant_runtime;
-GRANT SELECT,INSERT,UPDATE,DELETE ON workspaces,workspace_members,workspace_invitations,channel_connections,customers,conversations,messages,leads,knowledge_items,follow_up_rules,audit_logs TO ydeck_tenant_runtime;
-DO $$ DECLARE t text; BEGIN FOREACH t IN ARRAY ARRAY['workspaces','workspace_members','workspace_invitations','channel_connections','customers','conversations','messages','leads','knowledge_items','follow_up_rules','audit_logs'] LOOP EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY',t); END LOOP; END $$;
+GRANT EXECUTE ON FUNCTION current_user_is_workspace_member(UUID) TO ydeck_tenant_runtime_v2;
+GRANT SELECT,INSERT,UPDATE,DELETE ON workspaces,workspace_members,workspace_invitations,channel_connections,customers,conversations,messages,leads,knowledge_items,follow_up_rules,audit_logs TO ydeck_tenant_runtime_v2;
+-- Keep workspace_members owner-bypassable for the SECURITY DEFINER membership lookup;
+-- the NOLOGIN runtime role is not the owner and remains subject to its enabled RLS policy.
+DO $$ DECLARE t text; BEGIN FOREACH t IN ARRAY ARRAY['workspaces','workspace_invitations','channel_connections','customers','conversations','messages','leads','knowledge_items','follow_up_rules','audit_logs'] LOOP EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY',t); END LOOP; END $$;

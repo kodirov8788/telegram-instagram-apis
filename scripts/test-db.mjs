@@ -11,11 +11,17 @@ if (!/^(postgres|.*(?:test|temp).*)$/i.test(sourceDb)) throw new Error(`Refusing
 const suffix = randomUUID().replaceAll('-', '').slice(0, 12);
 const dbName = `ydeck_test_${suffix}`;
 const login = `ydeck_test_login_${suffix}`;
+const runtimeRole = 'ydeck_tenant_runtime_v2';
 const qi = value => `"${value.replaceAll('"', '""')}"`;
 const admin = new Client({ connectionString: raw });
 let roleExisted = false;
 let dbCreated = false;
 let loginCreated = false;
+let db;
+let pool;
+let tx;
+let reused;
+let primaryError;
 
 async function expectCount(client, sql, expected, message) {
   const { rows } = await client.query(sql);
@@ -24,17 +30,19 @@ async function expectCount(client, sql, expected, message) {
 
 try {
   await admin.connect();
-  roleExisted = (await admin.query("SELECT 1 FROM pg_roles WHERE rolname='ydeck_tenant_runtime'")).rowCount === 1;
+  roleExisted = (await admin.query('SELECT 1 FROM pg_roles WHERE rolname=$1', [runtimeRole])).rowCount === 1;
+  if (!roleExisted) await admin.query(`CREATE ROLE ${qi(runtimeRole)} NOLOGIN NOINHERIT`);
   await admin.query(`CREATE ROLE ${qi(login)} LOGIN NOINHERIT CREATEROLE`);
   loginCreated = true;
-  if (roleExisted) await admin.query(`GRANT ydeck_tenant_runtime TO ${qi(login)} WITH ADMIN OPTION`);
+  await admin.query(`GRANT ${qi(login)} TO CURRENT_USER`);
+  await admin.query(`GRANT ${qi(runtimeRole)} TO ${qi(login)} WITH ADMIN OPTION`);
   await admin.query(`CREATE DATABASE ${qi(dbName)} OWNER ${qi(login)}`);
   dbCreated = true;
 
-  const testUrl = new URL(raw); testUrl.pathname = `/${dbName}`; testUrl.username = login; testUrl.password = adminUrl.password;
+  const testUrl = new URL(raw); testUrl.pathname = `/${dbName}`;
   // Passwordless/local clusters can SET ROLE to the generated login. Hosted clusters generally
   // cannot create a login with the admin's password, so connect as admin then SET ROLE.
-  const db = new Client({ connectionString: raw.replace(`/${sourceDb}`, `/${dbName}`) });
+  db = new Client({ connectionString: testUrl.toString() });
   await db.connect();
   await db.query(`SET ROLE ${qi(login)}`);
   const schema = await readFile(new URL('../src/db/schema.sql', import.meta.url), 'utf8');
@@ -52,28 +60,39 @@ try {
   await db.query("INSERT INTO conversations(id,workspace_id,customer_id,channel) VALUES($1,$2,$3,'telegram'),($4,$5,$6,'telegram')", [ids.v1,ids.w1,ids.c1,ids.v2,ids.w2,ids.c2]);
   await db.query("INSERT INTO messages(conversation_id,sender,content) VALUES($1,'customer','one'),($2,'customer','two')", [ids.v1,ids.v2]);
 
-  const pool = new Pool({ connectionString: raw.replace(`/${sourceDb}`, `/${dbName}`), max: 1 });
-  const tx = await pool.connect();
+  pool = new Pool({ connectionString: testUrl.toString(), max: 1 });
+  tx = await pool.connect();
   await tx.query(`SET ROLE ${qi(login)}`);
-  await tx.query('BEGIN'); await tx.query(`SET LOCAL ROLE ydeck_tenant_runtime`); await tx.query("SELECT set_config('app.user_id',$1,true)",[ids.u1]);
+  await tx.query('BEGIN'); await tx.query(`SET LOCAL ROLE ${qi(runtimeRole)}`); await tx.query("SELECT set_config('app.user_id',$1,true)",[ids.u1]);
   await expectCount(tx, 'SELECT count(*) FROM workspaces', 1, 'cross-tenant workspace read');
   await expectCount(tx, 'SELECT count(*) FROM messages', 1, 'cross-tenant message read');
-  await tx.query('ROLLBACK'); tx.release();
-  const reused = await pool.connect();
+  await tx.query('ROLLBACK'); tx.release(); tx = undefined;
+  reused = await pool.connect();
   const state = await reused.query("SELECT current_role, current_setting('app.user_id',true) AS uid");
-  if (state.rows[0].current_role === 'ydeck_tenant_runtime' || state.rows[0].uid) throw new Error('transaction-local role/GUC leaked after rollback/pool reuse');
-  await reused.query('BEGIN'); await reused.query('SET LOCAL ROLE ydeck_tenant_runtime'); await reused.query("SELECT set_config('app.user_id',$1,true)",[ids.u1]);
+  if (state.rows[0].current_role === runtimeRole || state.rows[0].uid) throw new Error('transaction-local role/GUC leaked after rollback/pool reuse');
+  await reused.query('BEGIN'); await reused.query(`SET LOCAL ROLE ${qi(runtimeRole)}`); await reused.query("SELECT set_config('app.user_id',$1,true)",[ids.u1]);
   await expectCount(reused, 'SELECT count(*) FROM messages', 1, 'message RLS after pool reuse');
   let denied = false;
   try { await reused.query("INSERT INTO messages(conversation_id,sender,content) VALUES($1,'human_operator','blocked')", [ids.v2]); }
   catch (error) { denied = error?.code === '42501'; }
   if (!denied) throw new Error('cross-tenant message write was not denied by FORCE RLS');
-  await reused.query('COMMIT'); reused.release(); await pool.end(); await db.end();
+  await reused.query('COMMIT'); reused.release(); reused = undefined; await pool.end(); pool = undefined; await db.end(); db = undefined;
   console.log(`PostgreSQL integration checks passed in isolated database ${dbName}`);
+} catch (error) {
+  primaryError = error;
 } finally {
-  if (dbCreated) { await admin.query(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname=$1`, [dbName]); await admin.query(`DROP DATABASE IF EXISTS ${qi(dbName)}`); }
-  if (roleExisted && loginCreated) await admin.query(`REVOKE ADMIN OPTION FOR ydeck_tenant_runtime FROM ${qi(login)}`).catch(() => {});
-  if (loginCreated) await admin.query(`DROP ROLE IF EXISTS ${qi(login)}`);
-  if (!roleExisted) await admin.query('DROP ROLE IF EXISTS ydeck_tenant_runtime');
-  await admin.end();
+  const cleanupErrors = [];
+  if (tx) { tx.release(true); tx = undefined; }
+  if (reused) { reused.release(true); reused = undefined; }
+  if (pool) await pool.end().catch(error => cleanupErrors.push(error));
+  if (db) await db.end().catch(error => cleanupErrors.push(error));
+  try {
+    if (dbCreated) { await admin.query(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname=$1`, [dbName]); await admin.query(`DROP DATABASE IF EXISTS ${qi(dbName)}`); }
+    if (roleExisted && loginCreated) await admin.query(`REVOKE ADMIN OPTION FOR ${qi(runtimeRole)} FROM ${qi(login)}`).catch(() => {});
+    if (loginCreated) await admin.query(`DROP ROLE IF EXISTS ${qi(login)}`);
+    if (!roleExisted) await admin.query(`DROP ROLE IF EXISTS ${qi(runtimeRole)}`);
+  } catch (error) { cleanupErrors.push(error); }
+  await admin.end().catch(error => cleanupErrors.push(error));
+  if (!primaryError && cleanupErrors[0]) primaryError = cleanupErrors[0];
 }
+if (primaryError) throw primaryError;

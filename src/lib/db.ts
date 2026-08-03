@@ -20,7 +20,7 @@ export async function tenantTransaction<T>(userId: string, operation: (client: D
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    await client.query('SET LOCAL ROLE ydeck_tenant_runtime');
+    await client.query('SET LOCAL ROLE ydeck_tenant_runtime_v2');
     await client.query("SELECT set_config('app.user_id', $1, true)", [userId]);
     const value = await operation(client);
     await client.query('COMMIT');
