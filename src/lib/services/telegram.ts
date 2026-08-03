@@ -18,6 +18,7 @@ export interface TelegramWebhookMessage {
     };
     date: number;
     text?: string;
+    caption?: string;
     photo?: any[];
     document?: any;
     voice?: any;
