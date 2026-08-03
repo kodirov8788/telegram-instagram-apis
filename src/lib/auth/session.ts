@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto';
 import type { NextRequest } from 'next/server';
-import { query } from '@/lib/db';
+import { query, type DbClient } from '@/lib/db';
 import { can, type Permission, type Role } from './permissions';
 import { HttpError, uuid } from '../http/validation';
 
@@ -11,10 +11,10 @@ const hash = (token: string) => createHash('sha256').update(token).digest('hex')
 export interface Principal { userId: string; email: string; }
 export interface WorkspacePrincipal extends Principal { workspaceId: string; role: Role; }
 
-export async function createSession(userId: string) {
+export async function createSession(userId: string, client: DbClient = { query }) {
   const token = randomBytes(32).toString('hex');
   const expiresAt = new Date(Date.now() + SESSION_TTL_MS);
-  await query('INSERT INTO user_sessions (user_id, token_hash, expires_at) VALUES ($1, $2, $3)', [userId, hash(token), expiresAt]);
+  await client.query('INSERT INTO user_sessions (user_id, token_hash, expires_at) VALUES ($1, $2, $3)', [userId, hash(token), expiresAt]);
   return { token, expiresAt };
 }
 

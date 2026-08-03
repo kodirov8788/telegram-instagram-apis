@@ -1,4 +1,4 @@
-import pool, { query } from '../db';
+import pool, { query, type DbClient } from '../db';
 
 export interface WorkspaceConfig {
   id?: string;
@@ -51,13 +51,13 @@ export class WorkspaceService {
     }
   }
 
-  static async getWorkspaceById(workspaceId: string) {
-    const res = await query(`SELECT * FROM workspaces WHERE id = $1`, [workspaceId]);
+  static async getWorkspaceById(workspaceId: string, client: DbClient = { query }) {
+    const res = await client.query(`SELECT * FROM workspaces WHERE id = $1`, [workspaceId]);
     return res.rows[0] || null;
   }
 
-  static async updateWorkspaceConfig(workspaceId: string, updates: Partial<WorkspaceConfig>) {
-    const res = await query(
+  static async updateWorkspaceConfig(workspaceId: string, updates: Partial<WorkspaceConfig>, client: DbClient = { query }) {
+    const res = await client.query(
       `UPDATE workspaces 
        SET name = COALESCE($1, name),
            industry = COALESCE($2, industry),

@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS workspaces (
 );
 
 -- 3. Users & Workspace Memberships (RBAC)
-CREATE TYPE user_role AS ENUM ('owner', 'admin', 'sales_manager', 'sales_representative', 'support_operator', 'read_only_analyst');
+DO $$ BEGIN CREATE TYPE user_role AS ENUM ('owner', 'admin', 'sales_manager', 'sales_representative', 'support_operator', 'read_only_analyst'); EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
 CREATE TABLE IF NOT EXISTS users (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -61,7 +61,7 @@ CREATE TABLE IF NOT EXISTS workspace_invitations (
 );
 
 -- 4. Channel Connections (Telegram & Instagram)
-CREATE TYPE channel_type AS ENUM ('telegram', 'instagram');
+DO $$ BEGIN CREATE TYPE channel_type AS ENUM ('telegram', 'instagram'); EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
 CREATE TABLE IF NOT EXISTS channel_connections (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -93,8 +93,8 @@ CREATE TABLE IF NOT EXISTS customers (
 );
 
 -- 6. Conversations
-CREATE TYPE control_mode AS ENUM ('auto', 'approval', 'suggestion', 'human');
-CREATE TYPE conversation_status AS ENUM ('new', 'ai_handling', 'waiting_for_customer', 'human_attention_required', 'human_handling', 'qualified_lead', 'resolved', 'closed', 'spam');
+DO $$ BEGIN CREATE TYPE control_mode AS ENUM ('auto', 'approval', 'suggestion', 'human'); EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DO $$ BEGIN CREATE TYPE conversation_status AS ENUM ('new', 'ai_handling', 'waiting_for_customer', 'human_attention_required', 'human_handling', 'qualified_lead', 'resolved', 'closed', 'spam'); EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
 CREATE TABLE IF NOT EXISTS conversations (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -115,7 +115,7 @@ CREATE TABLE IF NOT EXISTS conversations (
 );
 
 -- 7. Messages
-CREATE TYPE sender_type AS ENUM ('customer', 'ai', 'human_operator', 'system');
+DO $$ BEGIN CREATE TYPE sender_type AS ENUM ('customer', 'ai', 'human_operator', 'system'); EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
 CREATE TABLE IF NOT EXISTS messages (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -132,7 +132,7 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 
 -- 8. Leads
-CREATE TYPE lead_status AS ENUM ('unqualified', 'new_lead', 'interested', 'qualified', 'high_priority', 'not_interested', 'customer', 'lost');
+DO $$ BEGIN CREATE TYPE lead_status AS ENUM ('unqualified', 'new_lead', 'interested', 'qualified', 'high_priority', 'not_interested', 'customer', 'lost'); EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
 CREATE TABLE IF NOT EXISTS leads (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -200,6 +200,7 @@ CREATE INDEX IF NOT EXISTS idx_leads_workspace_status ON leads(workspace_id, sta
 CREATE INDEX IF NOT EXISTS idx_knowledge_items_workspace ON knowledge_items(workspace_id);
 CREATE INDEX IF NOT EXISTS idx_user_sessions_user ON user_sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_workspace_invitations_workspace ON workspace_invitations(workspace_id);
+CREATE UNIQUE INDEX IF NOT EXISTS workspace_invitations_one_live_email ON workspace_invitations(workspace_id, lower(email)) WHERE accepted_at IS NULL;
 
 -- Supabase/PostgREST defense in depth. Direct clients cannot select another tenant.
 CREATE OR REPLACE FUNCTION current_user_is_workspace_member(target UUID)
@@ -219,13 +220,28 @@ ALTER TABLE knowledge_items ENABLE ROW LEVEL SECURITY;
 ALTER TABLE follow_up_rules ENABLE ROW LEVEL SECURITY;
 ALTER TABLE audit_logs ENABLE ROW LEVEL SECURITY;
 
-CREATE POLICY workspace_tenant_policy ON workspaces USING (current_user_is_workspace_member(id));
-CREATE POLICY member_tenant_policy ON workspace_members USING (current_user_is_workspace_member(workspace_id));
-CREATE POLICY invitation_tenant_policy ON workspace_invitations USING (current_user_is_workspace_member(workspace_id));
-CREATE POLICY channel_tenant_policy ON channel_connections USING (current_user_is_workspace_member(workspace_id));
-CREATE POLICY customer_tenant_policy ON customers USING (current_user_is_workspace_member(workspace_id));
-CREATE POLICY conversation_tenant_policy ON conversations USING (current_user_is_workspace_member(workspace_id));
-CREATE POLICY lead_tenant_policy ON leads USING (current_user_is_workspace_member(workspace_id));
-CREATE POLICY knowledge_tenant_policy ON knowledge_items USING (current_user_is_workspace_member(workspace_id));
-CREATE POLICY follow_up_tenant_policy ON follow_up_rules USING (current_user_is_workspace_member(workspace_id));
-CREATE POLICY audit_tenant_policy ON audit_logs USING (current_user_is_workspace_member(workspace_id));
+DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='workspaces' AND policyname='workspace_tenant_policy') THEN CREATE POLICY workspace_tenant_policy ON workspaces USING (current_user_is_workspace_member(id)) WITH CHECK (current_user_is_workspace_member(id)); END IF; END $$;
+DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='workspace_members' AND policyname='member_tenant_policy') THEN CREATE POLICY member_tenant_policy ON workspace_members USING (current_user_is_workspace_member(workspace_id)) WITH CHECK (current_user_is_workspace_member(workspace_id)); END IF; END $$;
+DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='workspace_invitations' AND policyname='invitation_tenant_policy') THEN CREATE POLICY invitation_tenant_policy ON workspace_invitations USING (current_user_is_workspace_member(workspace_id)) WITH CHECK (current_user_is_workspace_member(workspace_id)); END IF; END $$;
+DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='channel_connections' AND policyname='channel_tenant_policy') THEN CREATE POLICY channel_tenant_policy ON channel_connections USING (current_user_is_workspace_member(workspace_id)) WITH CHECK (current_user_is_workspace_member(workspace_id)); END IF; END $$;
+DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='customers' AND policyname='customer_tenant_policy') THEN CREATE POLICY customer_tenant_policy ON customers USING (current_user_is_workspace_member(workspace_id)) WITH CHECK (current_user_is_workspace_member(workspace_id)); END IF; END $$;
+DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='conversations' AND policyname='conversation_tenant_policy') THEN CREATE POLICY conversation_tenant_policy ON conversations USING (current_user_is_workspace_member(workspace_id)) WITH CHECK (current_user_is_workspace_member(workspace_id)); END IF; END $$;
+DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='leads' AND policyname='lead_tenant_policy') THEN CREATE POLICY lead_tenant_policy ON leads USING (current_user_is_workspace_member(workspace_id)) WITH CHECK (current_user_is_workspace_member(workspace_id)); END IF; END $$;
+DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='knowledge_items' AND policyname='knowledge_tenant_policy') THEN CREATE POLICY knowledge_tenant_policy ON knowledge_items USING (current_user_is_workspace_member(workspace_id)) WITH CHECK (current_user_is_workspace_member(workspace_id)); END IF; END $$;
+DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='follow_up_rules' AND policyname='follow_up_tenant_policy') THEN CREATE POLICY follow_up_tenant_policy ON follow_up_rules USING (current_user_is_workspace_member(workspace_id)) WITH CHECK (current_user_is_workspace_member(workspace_id)); END IF; END $$;
+DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='audit_logs' AND policyname='audit_tenant_policy') THEN CREATE POLICY audit_tenant_policy ON audit_logs USING (current_user_is_workspace_member(workspace_id)) WITH CHECK (current_user_is_workspace_member(workspace_id)); END IF; END $$;
+
+
+-- Fresh-install equivalents of migration 002 integrity and runtime-role controls.
+DO $$ BEGIN
+ IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='customers_id_workspace_unique') THEN ALTER TABLE customers ADD CONSTRAINT customers_id_workspace_unique UNIQUE(id,workspace_id); END IF;
+ IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='conversations_id_workspace_unique') THEN ALTER TABLE conversations ADD CONSTRAINT conversations_id_workspace_unique UNIQUE(id,workspace_id); END IF;
+ IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='conversations_customer_tenant_fk') THEN ALTER TABLE conversations ADD CONSTRAINT conversations_customer_tenant_fk FOREIGN KEY(customer_id,workspace_id) REFERENCES customers(id,workspace_id); END IF;
+ IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='leads_customer_tenant_fk') THEN ALTER TABLE leads ADD CONSTRAINT leads_customer_tenant_fk FOREIGN KEY(customer_id,workspace_id) REFERENCES customers(id,workspace_id); END IF;
+ IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='leads_conversation_tenant_fk') THEN ALTER TABLE leads ADD CONSTRAINT leads_conversation_tenant_fk FOREIGN KEY(conversation_id,workspace_id) REFERENCES conversations(id,workspace_id); END IF;
+END $$;
+DO $$ BEGIN IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='ydeck_tenant_runtime') THEN CREATE ROLE ydeck_tenant_runtime NOLOGIN NOINHERIT; END IF; END $$;
+REVOKE ALL ON FUNCTION current_user_is_workspace_member(UUID) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION current_user_is_workspace_member(UUID) TO ydeck_tenant_runtime;
+GRANT SELECT,INSERT,UPDATE,DELETE ON workspaces,workspace_members,workspace_invitations,channel_connections,customers,conversations,messages,leads,knowledge_items,follow_up_rules,audit_logs TO ydeck_tenant_runtime;
+DO $$ DECLARE t text; BEGIN FOREACH t IN ARRAY ARRAY['workspaces','workspace_members','workspace_invitations','channel_connections','customers','conversations','messages','leads','knowledge_items','follow_up_rules','audit_logs'] LOOP EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY',t); END LOOP; END $$;
