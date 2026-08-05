@@ -81,13 +81,51 @@ runner restriction is resolved.
 
 ## Database deployment
 
-Apply `src/db/schema.sql` for fresh databases, or apply migrations in sequence (from `002_auth_rbac_rls.sql` through `008_worker_queue_role.sql`) to the baseline schema, using the same
+Apply `src/db/schema.sql` for fresh databases, or apply migrations in sequence (from `002_auth_rbac_rls.sql` through `011_delivery_uncertainty_contract.sql`) to the baseline schema, using the same
 login configured in `DATABASE_URL`. The migration creates the fixed
 `ydeck_tenant_runtime_v2` role as `NOLOGIN NOINHERIT` and grants that role to the
 current migration login so runtime `SET LOCAL ROLE` works. The migration login
 therefore needs `CREATEROLE` when the role does not exist; if the role is
 pre-provisioned, it needs admin option on that role. Do not give the runtime
 role a password, `LOGIN`, `INHERIT`, `BYPASSRLS`, or table ownership.
+
+### Staged legacy identity reconciliation (009–010)
+
+Migrations 006–008 preserve ambiguous legacy customer and conversation rows by
+leaving their connection-scoped identities nullable. Fresh installations already
+require these values. Upgrade installations converge on the same invariant through
+an explicit two-stage gate:
+
+1. Apply `009_identity_reconciliation_prepare.sql`. This only creates locked-down
+   staging tables in `ydeck_migration`; it does not modify customer identities.
+2. Stop identity-changing writes, then insert one reviewed row into
+   `ydeck_migration.customer_identity_reconciliation` for every customer still
+   missing `connection_id` or `provider_user_id`. Insert one reviewed row into
+   `ydeck_migration.conversation_connection_reconciliation` for every conversation
+   still missing `connection_id`. Mappings must come from authoritative provider or
+   tenant records. Never infer a mapping merely because one active connection exists.
+3. Back up the affected tables and review the mapping counts independently. Keep
+   workers and webhook ingestion paused for the short finalization window.
+4. Apply `010_identity_reconciliation_finalize.sql`. It rejects the entire batch on
+   cross-workspace, cross-channel, customer/connection, conflicting, duplicate, or
+   unresolved data. Errors report aggregate counts only and never log identifiers or
+   message content.
+5. Resume workers only after 010 commits. Confirm `customers.connection_id`,
+   `customers.provider_user_id`, and `conversations.connection_id` are `NOT NULL` and
+   all listed foreign-key, identity-pair, and provider-completion constraints are
+   validated.
+
+Migration 010 validates temporary `CHECK ... NOT VALID` constraints before issuing
+`SET NOT NULL`. This moves the table scan outside the strongest lock, but the final
+metadata change still takes an `ACCESS EXCLUSIVE` lock. Set an appropriate
+`lock_timeout`, schedule the finalizer during a low-traffic window, and retry the
+whole transaction if lock acquisition times out. If the gate fails, correct only the
+staging mappings or source data and rerun 010; do not delete or guess legacy data.
+
+Migration 011 adds the durable delivery-uncertainty contract. Deploy it before the
+worker version that writes `dispatched_at`, `outbound_jobs.status = 'ambiguous'`, or
+`messages.delivery_status = 'unknown'`. Older workers remain compatible because the
+new timestamp is nullable and existing status values are unchanged.
 
 ## PGMQ Queue Deployment & Testing
 

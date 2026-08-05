@@ -122,7 +122,8 @@ CREATE TABLE IF NOT EXISTS customers (
     last_contact_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     CONSTRAINT customers_connection_tenant_fk FOREIGN KEY(connection_id,workspace_id) REFERENCES channel_connections(id,workspace_id) ON DELETE RESTRICT,
     CONSTRAINT customers_provider_identity_pair_check CHECK ((connection_id IS NULL) = (provider_user_id IS NULL)),
-    CONSTRAINT customers_connection_provider_user_unique UNIQUE(connection_id,provider_user_id)
+    CONSTRAINT customers_connection_provider_user_unique UNIQUE(connection_id,provider_user_id),
+    CONSTRAINT customers_id_workspace_connection_unique UNIQUE(id,workspace_id,connection_id)
 );
 
 -- 6. Conversations
@@ -146,7 +147,8 @@ CREATE TABLE IF NOT EXISTS conversations (
     summary TEXT,
     last_message_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    CONSTRAINT conversations_connection_tenant_fk FOREIGN KEY(connection_id,workspace_id,channel) REFERENCES channel_connections(id,workspace_id,channel) ON DELETE RESTRICT
+    CONSTRAINT conversations_connection_tenant_fk FOREIGN KEY(connection_id,workspace_id,channel) REFERENCES channel_connections(id,workspace_id,channel) ON DELETE RESTRICT,
+    CONSTRAINT conversations_customer_connection_fk FOREIGN KEY(customer_id,workspace_id,connection_id) REFERENCES customers(id,workspace_id,connection_id) ON DELETE CASCADE
 );
 
 -- 7. Messages
@@ -164,10 +166,11 @@ CREATE TABLE IF NOT EXISTS messages (
     content TEXT NOT NULL,
     message_type VARCHAR(50) DEFAULT 'text', -- text, image, document, voice, location, contact
     attachment_url TEXT,
-    delivery_status VARCHAR(20) DEFAULT 'sent', -- pending, sent, delivered, failed
+    delivery_status VARCHAR(20) DEFAULT 'sent', -- pending, sent, delivered, failed, unknown
     ai_confidence FLOAT,
     knowledge_sources_used JSONB,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    CONSTRAINT messages_delivery_status_check CHECK(delivery_status IN ('pending','sent','delivered','failed','unknown'))
 );
 
 CREATE TABLE IF NOT EXISTS outbound_jobs (
@@ -179,11 +182,12 @@ CREATE TABLE IF NOT EXISTS outbound_jobs (
     idempotency_key TEXT NOT NULL,
     provider channel_type NOT NULL,
     recipient_id TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','queued','processing','retryable_failed','sent','permanent_failed','cancelled')),
+    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','queued','processing','retryable_failed','sent','permanent_failed','cancelled','ambiguous')),
     attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
     next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     locked_at TIMESTAMPTZ,
     locked_by TEXT,
+    dispatched_at TIMESTAMPTZ,
     provider_message_id TEXT,
     last_error TEXT,
     sent_at TIMESTAMPTZ,
@@ -195,6 +199,8 @@ CREATE TABLE IF NOT EXISTS outbound_jobs (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS outbound_jobs_provider_ack_unique
   ON outbound_jobs(connection_id,provider_message_id) WHERE provider_message_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_outbound_jobs_ambiguous
+  ON outbound_jobs(dispatched_at,created_at) WHERE status='ambiguous';
 
 -- 8. Leads
 DO $$ BEGIN CREATE TYPE lead_status AS ENUM ('unqualified', 'new_lead', 'interested', 'qualified', 'high_priority', 'not_interested', 'customer', 'lost'); EXCEPTION WHEN duplicate_object THEN NULL; END $$;
