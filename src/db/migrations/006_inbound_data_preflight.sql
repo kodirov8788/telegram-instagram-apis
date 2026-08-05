@@ -5,6 +5,7 @@ ALTER TABLE public.customers ADD COLUMN IF NOT EXISTS connection_id UUID;
 ALTER TABLE public.customers ADD COLUMN IF NOT EXISTS provider_user_id TEXT;
 ALTER TABLE public.conversations ADD COLUMN IF NOT EXISTS connection_id UUID;
 ALTER TABLE public.messages ADD COLUMN IF NOT EXISTS workspace_id UUID;
+-- No authoritative legacy source exists; event ingestion populates this nullable link later.
 ALTER TABLE public.messages ADD COLUMN IF NOT EXISTS provider_event_id UUID;
 
 UPDATE public.messages m
@@ -13,7 +14,7 @@ FROM public.conversations c
 WHERE m.conversation_id = c.id AND m.workspace_id IS NULL;
 
 WITH unique_active_connections AS (
-  SELECT workspace_id, channel, MIN(id::text)::uuid AS connection_id
+  SELECT workspace_id, channel, (array_agg(id))[1] AS connection_id
   FROM public.channel_connections WHERE is_active IS TRUE
   GROUP BY workspace_id, channel HAVING COUNT(*) = 1
 )
@@ -33,7 +34,7 @@ WITH customer_channels AS (
   WHERE (telegram_id IS NOT NULL AND instagram_id IS NULL)
      OR (instagram_id IS NOT NULL AND telegram_id IS NULL)
 ), unique_active_connections AS (
-  SELECT workspace_id, channel, MIN(id::text)::uuid AS connection_id
+  SELECT workspace_id, channel, (array_agg(id))[1] AS connection_id
   FROM public.channel_connections WHERE is_active IS TRUE
   GROUP BY workspace_id, channel HAVING COUNT(*) = 1
 )
