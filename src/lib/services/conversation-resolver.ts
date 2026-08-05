@@ -1,5 +1,6 @@
 import type { DbClient } from '../db';
-export interface ActiveConversation { id:string; workspace_id:string; connection_id:string; customer_id:string; channel:'telegram'|'instagram'; status:string; }
+import type { UnifiedMessageDTO } from './message-queue';
+export interface ActiveConversation { id:string; workspace_id:string; connection_id:string; customer_id:string; channel:UnifiedMessageDTO['channel']; status:string; }
 export class ConversationResolverService {
  static async resolve(connectionId:string,customerId:string,client:DbClient):Promise<ActiveConversation> {
   if(!connectionId||!customerId) throw new Error('connectionId and customerId are required');

@@ -265,6 +265,12 @@ try {
   }
   for(const status of ['resolved','closed','spam']){await db.query('INSERT INTO conversations(workspace_id,connection_id,customer_id,channel,status) VALUES($1,$2,$3,$4,$5)',[ids.w1,identityConnections.first,concurrentCustomers[0].id,'telegram',status]);const active=await runtimeResolve(ids.u1,identityConnections.first,concurrentCustomers[0].id);if(active.status!=='new')throw new Error(`inactive status ${status} prevented a new active conversation`);await db.query('DELETE FROM conversations WHERE connection_id=$1 AND customer_id=$2',[identityConnections.first,concurrentCustomers[0].id]);}
 
+  const statusRace=[randomUUID(),randomUUID()];
+  await db.query("INSERT INTO conversations(id,workspace_id,connection_id,customer_id,channel,status) VALUES($1,$2,$3,$4,'telegram','resolved'),($5,$2,$3,$4,'telegram','closed')",[statusRace[0],ids.w1,identityConnections.first,concurrentCustomers[0].id,statusRace[1]]);
+  const statusRaceResults=await Promise.allSettled(statusRace.map(id=>pool.query("UPDATE conversations SET status='new' WHERE id=$1",[id])));
+  if(statusRaceResults.filter(result=>result.status==='fulfilled').length!==1||statusRaceResults.filter(result=>result.status==='rejected'&&result.reason?.code==='23505').length!==1)throw new Error('partial unique index did not serialize concurrent status activation');
+  await db.query('DELETE FROM conversations WHERE id=ANY($1::uuid[])',[statusRace]);
+
   let channelMismatch=false;
   try{await db.query("INSERT INTO conversations(workspace_id,connection_id,customer_id,channel) VALUES($1,$2,$3,'instagram')",[ids.w1,identityConnections.first,concurrentCustomers[0].id]);}catch(error){channelMismatch=error?.code==='23503';}
   if(!channelMismatch)throw new Error('conversation channel mismatch was not rejected');
