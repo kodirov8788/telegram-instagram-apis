@@ -1,4 +1,4 @@
-import { DbClient } from '../db';
+import type { TransactionRunner } from '../workers/transaction';
 
 export type Provider = 'telegram' | 'instagram';
 
@@ -28,14 +28,14 @@ export class ConnectionCredentialError extends Error {
 }
 
 export class DatabaseSecretProvider implements SecretProvider {
-  constructor(private readonly db: DbClient, private readonly vault?: VaultSecretReader) {}
+  constructor(private readonly transaction: TransactionRunner, private readonly vault?: VaultSecretReader) {}
 
   async getConnectionSecret(input: { connectionId: string; workspaceId: string; provider: Provider }) {
-    const result = await this.db.query(
+    const result = await this.transaction(db => db.query(
       `SELECT credentials FROM channel_connections
        WHERE id = $1 AND workspace_id = $2 AND channel = $3 AND is_active IS TRUE`,
       [input.connectionId, input.workspaceId, input.provider]
-    );
+    ));
     const credentials = result.rows[0]?.credentials as Record<string, unknown> | undefined;
     if (!credentials) throw new ConnectionCredentialError('Active channel connection not found');
 
