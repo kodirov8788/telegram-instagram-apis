@@ -94,16 +94,18 @@ export async function processOutboundJob(
     });
     return { outcome: 'sent' as const };
   } catch (error) {
-    if (dispatched) {
+    const providerError = error instanceof TelegramProviderError || error instanceof InstagramProviderError ? error : undefined;
+    // A structured HTTP error is a definitive provider rejection and is safe to
+    // retry/classify. Transport failures after dispatch have an unknown outcome.
+    if (dispatched && !providerError) {
       await markAmbiguous(transaction, job, safeError(error));
       return { outcome: 'ambiguous' as const };
     }
-    const providerError = error instanceof TelegramProviderError || error instanceof InstagramProviderError ? error : undefined;
     const permanent = error instanceof ConnectionCredentialError || job.attempts >= MAX_DELIVERY_ATTEMPTS || (providerError ? !providerError.retryable : false);
     const delay = retryDelayMs(job.attempts, providerError?.retryAfterMs, dependencies.random);
     await transaction(async db => {
       await db.query(
-        `UPDATE outbound_jobs SET status = $2, last_error = $3,
+        `UPDATE outbound_jobs SET status = $2, last_error = $3, dispatched_at = NULL, locked_at = NULL,
           next_attempt_at = CASE WHEN $2 = 'retryable_failed' THEN NOW() + ($4 * INTERVAL '1 millisecond') ELSE next_attempt_at END
          WHERE id = $1`,
         [job.id, permanent ? 'permanent_failed' : 'retryable_failed', safeError(error), delay]

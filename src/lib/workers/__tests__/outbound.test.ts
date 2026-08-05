@@ -37,9 +37,16 @@ describe('processOutboundJob', () => {
     expect(JSON.stringify(h.queries)).not.toContain('secret-token');
   });
 
-  it('marks a provider-call failure ambiguous after recording dispatch', async () => {
+  it('retries a definitive provider rejection after clearing the dispatch marker', async () => {
     const h = harness(async () => { throw new TelegramProviderError('Telegram request failed (429)', true, 12_000); });
-    await expect(processOutboundJob('job', h.secrets, { ...h, random: () => 0 })).resolves.toEqual({ outcome: 'ambiguous' });
+    await expect(processOutboundJob('job', h.secrets, { ...h, random: () => 0 })).rejects.toThrow('retryable');
+    expect(h.queries.some(q => q.text.includes('dispatched_at = NULL'))).toBe(true);
+    expect(h.queries.some(q => q.text.includes("status = 'ambiguous'"))).toBe(false);
+  });
+
+  it('marks a transport-level provider outcome ambiguous', async () => {
+    const h = harness(async () => { throw new DOMException('timed out', 'TimeoutError'); });
+    await expect(processOutboundJob('job', h.secrets, h)).resolves.toEqual({ outcome: 'ambiguous' });
     expect(h.queries.some(q => q.text.includes("status = 'ambiguous'"))).toBe(true);
     expect(h.queries.some(q => q.text.includes("delivery_status = 'unknown'"))).toBe(true);
   });
