@@ -60,8 +60,19 @@ The project includes quality gate commands for build, test, lint, and type safet
 ### Dependency Audit Notes
 Next.js and `eslint-config-next` are pinned to `15.5.21`. Vitest is pinned to `4.1.10`, and the PostCSS and Sharp overrides keep transitive dependencies on patched releases. The committed lockfile and full dependency audit cover both runtime and development tooling.
 
-## Continuous Integration
-GitHub Actions automatically runs all quality gates (`npm ci`, `npm run lint`, `npm run typecheck`, `npm test`, `npm run build`, `npm audit`) on every push and pull request.
+## Local validation
+
+Before opening a pull request, run the relevant quality gates locally. For a
+full application change, use:
+
+```bash
+npm ci
+npm run lint
+npm run typecheck
+npm test
+npm run build
+npm audit --audit-level=high
+```
 
 ## Database deployment
 
