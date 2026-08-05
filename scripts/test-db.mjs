@@ -44,6 +44,9 @@ try {
   // cannot create a login with the admin's password, so connect as admin then SET ROLE.
   db = new Client({ connectionString: testUrl.toString() });
   await db.connect();
+  // Extensions are cluster-admin operations on stock PostgreSQL. Install the
+  // required extension before exercising schema deployment as the migration login.
+  await db.query('CREATE EXTENSION IF NOT EXISTS vector');
   await db.query(`SET ROLE ${qi(login)}`);
   const schema = await readFile(new URL('../src/db/schema.sql', import.meta.url), 'utf8');
   const migration = await readFile(new URL('../src/db/migrations/002_auth_rbac_rls.sql', import.meta.url), 'utf8');
@@ -174,6 +177,7 @@ try {
 
   // Try inserting with GUC pointing to a connection identifier we don't have access to
   let rlsInsertDenied = false;
+  await reused.query('SAVEPOINT expected_rls_insert_failure');
   try {
     await reused.query(
       "INSERT INTO provider_events(workspace_id, connection_id, provider, provider_event_id, payload, payload_hash, status) VALUES($1, $2, 'telegram', 'rls-test-2', '{}', 'hash', 'received')",
@@ -181,7 +185,9 @@ try {
     );
   } catch (error) {
     rlsInsertDenied = error?.code === '42501'; // insufficient privilege (RLS WITH CHECK constraint violation)
+    await reused.query('ROLLBACK TO SAVEPOINT expected_rls_insert_failure');
   }
+  await reused.query('RELEASE SAVEPOINT expected_rls_insert_failure');
   if (!rlsInsertDenied) throw new Error('cross-tenant/wrong GUC provider event insert was not denied by RLS');
 
   // Restore matching GUC and cleanup
@@ -194,8 +200,10 @@ try {
   await reused.query('BEGIN'); await reused.query(`SET LOCAL ROLE ${qi(runtimeRole)}`); await reused.query("SELECT set_config('app.user_id',$1,true)",[ids.u1]);
   await expectCount(reused, 'SELECT count(*) FROM messages', 1, 'message RLS after pool reuse');
   let denied = false;
+  await reused.query('SAVEPOINT expected_message_rls_failure');
   try { await reused.query("INSERT INTO messages(conversation_id,sender,content) VALUES($1,'human_operator','blocked')", [ids.v2]); }
-  catch (error) { denied = error?.code === '42501'; }
+  catch (error) { denied = error?.code === '42501'; await reused.query('ROLLBACK TO SAVEPOINT expected_message_rls_failure'); }
+  await reused.query('RELEASE SAVEPOINT expected_message_rls_failure');
   if (!denied) throw new Error('cross-tenant message write was not denied by FORCE RLS');
   await reused.query('COMMIT'); reused.release(); reused = undefined; await pool.end(); pool = undefined; await db.end(); db = undefined;
   console.log(`PostgreSQL integration checks passed in isolated database ${dbName}`);
