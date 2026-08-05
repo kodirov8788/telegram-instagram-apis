@@ -14,6 +14,8 @@ interface OutboundJob {
   recipient_id: string;
   attempts: number;
   content: string;
+  dispatched_at: Date | string | null;
+  provider_message_id: string | null;
 }
 
 export interface ProviderSender {
@@ -59,10 +61,27 @@ export async function processOutboundJob(
     return { outcome: 'ignored' as const };
   }
 
+  if (job.dispatched_at && !job.provider_message_id) {
+    await markAmbiguous(transaction, job, 'Provider dispatch outcome is unknown after worker recovery');
+    return { outcome: 'ambiguous' as const };
+  }
+
+  let dispatched = false;
   try {
     const secret = await secrets.getConnectionSecret({
       connectionId: job.connection_id, workspaceId: job.workspace_id, provider: job.provider,
     });
+    const dispatch = await transaction(db => db.query(
+      `UPDATE outbound_jobs SET dispatched_at = NOW(), updated_at = NOW()
+       WHERE id = $1 AND dispatched_at IS NULL
+       RETURNING id`,
+      [job.id]
+    ));
+    if (dispatch.rows.length === 0) {
+      await markAmbiguous(transaction, job, 'Provider dispatch state changed before delivery');
+      return { outcome: 'ambiguous' as const };
+    }
+    dispatched = true;
     const ack = await (dependencies.sender ?? defaultSender).send(job.provider, secret.accessToken, job.recipient_id, job.content);
     await transaction(async db => {
       await db.query(
@@ -75,6 +94,10 @@ export async function processOutboundJob(
     });
     return { outcome: 'sent' as const };
   } catch (error) {
+    if (dispatched) {
+      await markAmbiguous(transaction, job, safeError(error));
+      return { outcome: 'ambiguous' as const };
+    }
     const providerError = error instanceof TelegramProviderError || error instanceof InstagramProviderError ? error : undefined;
     const permanent = error instanceof ConnectionCredentialError || job.attempts >= MAX_DELIVERY_ATTEMPTS || (providerError ? !providerError.retryable : false);
     const delay = retryDelayMs(job.attempts, providerError?.retryAfterMs, dependencies.random);
@@ -90,6 +113,17 @@ export async function processOutboundJob(
     if (!permanent) throw new RetryableWorkError(delay, 'Outbound delivery is retryable');
     return { outcome: 'permanent_failed' as const };
   }
+}
+
+async function markAmbiguous(transaction: TransactionRunner, job: OutboundJob, reason: string): Promise<void> {
+  await transaction(async db => {
+    await db.query(
+      `UPDATE outbound_jobs SET status = 'ambiguous', last_error = $2,
+        locked_at = NULL, updated_at = NOW() WHERE id = $1`,
+      [job.id, reason.slice(0, 500)]
+    );
+    await db.query("UPDATE messages SET delivery_status = 'unknown' WHERE id = $1", [job.message_id]);
+  });
 }
 
 function safeError(error: unknown): string {
