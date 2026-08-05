@@ -61,7 +61,23 @@ The project includes quality gate commands for build, test, lint, and type safet
 Next.js and `eslint-config-next` are pinned to `15.5.21`. Vitest is pinned to `4.1.10`, and the PostCSS and Sharp overrides keep transitive dependencies on patched releases. The committed lockfile and full dependency audit cover both runtime and development tooling.
 
 ## Continuous Integration
-GitHub Actions automatically runs all quality gates (`npm ci`, `npm run lint`, `npm run typecheck`, `npm test`, `npm run build`, `npm audit`) on every push and pull request.
+GitHub-hosted Actions are temporarily disabled because the repository account cannot
+start hosted runners. Before approving any pull request, reviewers must run the
+documented quality gates from a clean checkout with a supported Node.js version:
+
+```bash
+npm ci
+npm run lint
+npm run typecheck
+npm test
+npm run build
+npm audit --audit-level=high
+git diff --check
+```
+
+Database and RLS changes additionally require the opt-in `npm run test:db` check
+with a safe `TEST_DATABASE_ADMIN_URL`. Restore hosted CI when the account-level
+runner restriction is resolved.
 
 ## Database deployment
 
