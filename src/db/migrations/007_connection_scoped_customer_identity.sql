@@ -1,5 +1,9 @@
 -- Issue #57: connection-scoped customer identity and least-privilege mutation.
--- Forward recovery: resolve the aggregate-only preflight counts, then rerun this migration.
+-- Forward recovery: inspect duplicate groups and invalid connection references with privileged,
+-- access-controlled queries. Restore an orphaned connection or reconcile its workspace from an
+-- authoritative provider mapping; correct provider/connection inputs when they disagree. Never
+-- auto-delete, merge, clear, or reassign customer identities from these aggregate counts alone.
+-- After reviewed corrections reduce both counts to zero, rerun this idempotent migration.
 -- Rollback: restore direct customer DML only if the application is rolled back first; dropping
 -- the function/index/FK is safe, but does not undo identities already created through the API.
 BEGIN;
