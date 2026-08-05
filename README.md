@@ -89,3 +89,41 @@ current migration login so runtime `SET LOCAL ROLE` works. The migration login
 therefore needs `CREATEROLE` when the role does not exist; if the role is
 pre-provisioned, it needs admin option on that role. Do not give the runtime
 role a password, `LOGIN`, `INHERIT`, `BYPASSRLS`, or table ownership.
+
+## PGMQ Queue Deployment & Testing
+
+This project incorporates the `pgmq` extension for durable, logged queue operations (`inbound_events` and `outbound_messages`).
+
+### PGMQ Pre-requisites & Verification Environment
+The verified local and integration environment uses:
+- Postgres image: `ghcr.io/pgmq/pg18-pgmq:v1.10.0`
+- Docker digest: `sha256:bfb3537068ce453609744518ece92b178ac89dff53747d47ca6fab91c2fc66a6`
+- Extension version: `1.10.0` (or any compatible v1.x)
+
+### Running Database Queue Integration Tests
+A separate test suite exists specifically to verify PGMQ migrations and operations. It requires a test database admin connection URL:
+
+```bash
+TEST_QUEUE_DATABASE_URL='postgresql://postgres:postgres@localhost:5432/postgres' npm run test:queue:db
+```
+
+*Note: This command will refuse to run if `TEST_QUEUE_DATABASE_URL` is omitted, if `DATABASE_URL` is used, or if the target database name is production-like.*
+
+### Deployment
+Apply `src/db/migrations/005_pgmq_queues.sql` to your database. This migration:
+1. Performs preflight checks to verify `pgmq` extension availability and compatibility.
+2. Installs the `pgmq` extension.
+3. Initializes the `inbound_events` and `outbound_messages` queues.
+4. Revokes all public execute/select/update privileges on the `pgmq` schema from `PUBLIC`, `anon`, and `authenticated` roles to prevent PostgREST exposure.
+5. Grants `ydeck_tenant_runtime_v2` access only to the fixed `ydeck_queue` security-definer wrappers. The runtime role receives no direct `pgmq` schema, function, queue-table, or archive-table privileges.
+
+### Non-Destructive Rollback Instructions
+To rollback `005_pgmq_queues.sql` without risk of message data loss:
+1. **Stop Producers/Consumers**: Disable all active workers, webhook routes, and queue clients.
+2. **Retain and Back Up Queue State**: Export/dump data from the following tables without dropping them:
+   - Queue tables: `pgmq.q_inbound_events`, `pgmq.q_outbound_messages`
+   - Archive tables: `pgmq.a_inbound_events`, `pgmq.a_outbound_messages`
+3. **Disable Application Use**: Roll back producers and consumers or deploy a forward corrective migration while preserving active and archived messages.
+4. **Replay Safely**: Use the durable provider-event ledger as the inbound replay source after the corrective deployment.
+
+Do not run `pgmq.drop_queue` or `DROP EXTENSION pgmq CASCADE` as routine rollback operations; both can destroy recovery state.
