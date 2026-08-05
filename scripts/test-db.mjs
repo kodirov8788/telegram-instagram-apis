@@ -115,12 +115,15 @@ try {
   const preflight = {
     workspace: randomUUID(), ambiguousWorkspace: randomUUID(),
     connection: randomUUID(), ambiguousConnection1: randomUUID(), ambiguousConnection2: randomUUID(),
-    customer: randomUUID(), ambiguousCustomer: randomUUID(), dualCustomer: randomUUID(),
+    instagramConnection: randomUUID(), customer: randomUUID(), instagramCustomer: randomUUID(),
+    conflictingCustomer: randomUUID(), ambiguousCustomer: randomUUID(), dualCustomer: randomUUID(),
     conversation: randomUUID(), ambiguousConversation: randomUUID(), message: randomUUID(),
   };
   await db.query("INSERT INTO workspaces(id,name) VALUES($1,'Preflight'),($2,'Ambiguous preflight')", [preflight.workspace, preflight.ambiguousWorkspace]);
-  await db.query("INSERT INTO channel_connections(id,workspace_id,channel,account_identifier,credentials,is_active) VALUES($1,$2,'telegram','single','{}',true),($3,$4,'telegram','ambiguous-1','{}',true),($5,$4,'telegram','ambiguous-2','{}',true)", [preflight.connection, preflight.workspace, preflight.ambiguousConnection1, preflight.ambiguousWorkspace, preflight.ambiguousConnection2]);
+  await db.query("INSERT INTO channel_connections(id,workspace_id,channel,account_identifier,credentials,is_active) VALUES($1,$2,'telegram','single','{}',true),($3,$2,'instagram','instagram-single','{}',true),($4,$5,'telegram','ambiguous-1','{}',true),($6,$5,'telegram','ambiguous-2','{}',true)", [preflight.connection, preflight.workspace, preflight.instagramConnection, preflight.ambiguousConnection1, preflight.ambiguousWorkspace, preflight.ambiguousConnection2]);
   await db.query("INSERT INTO customers(id,workspace_id,full_name,telegram_id) VALUES($1,$2,'Single','provider-single'),($3,$4,'Ambiguous','provider-ambiguous')", [preflight.customer, preflight.workspace, preflight.ambiguousCustomer, preflight.ambiguousWorkspace]);
+  await db.query("INSERT INTO customers(id,workspace_id,full_name,instagram_id) VALUES($1,$2,'Instagram','instagram-provider')", [preflight.instagramCustomer, preflight.workspace]);
+  await db.query("INSERT INTO customers(id,workspace_id,full_name,telegram_id,connection_id) VALUES($1,$2,'Conflicting','provider-conflict',$3)", [preflight.conflictingCustomer, preflight.workspace, preflight.ambiguousConnection1]);
   await db.query("INSERT INTO customers(id,workspace_id,full_name,telegram_id,instagram_id) VALUES($1,$2,'Dual','telegram-dual','instagram-dual')", [preflight.dualCustomer, preflight.workspace]);
   await db.query("INSERT INTO conversations(id,workspace_id,customer_id,channel) VALUES($1,$2,$3,'telegram'),($4,$5,$6,'telegram')", [preflight.conversation, preflight.workspace, preflight.customer, preflight.ambiguousConversation, preflight.ambiguousWorkspace, preflight.ambiguousCustomer]);
   await db.query("INSERT INTO messages(id,conversation_id,sender,content) VALUES($1,$2,'customer','preflight')", [preflight.message, preflight.conversation]);
@@ -130,15 +133,21 @@ try {
     SELECT
       (SELECT connection_id FROM customers WHERE id=$1) AS customer_connection,
       (SELECT provider_user_id FROM customers WHERE id=$1) AS customer_provider,
-      (SELECT connection_id FROM customers WHERE id=$2) AS ambiguous_customer_connection,
-      (SELECT provider_user_id FROM customers WHERE id=$2) AS ambiguous_customer_provider,
-      (SELECT connection_id FROM customers WHERE id=$3) AS dual_customer_connection,
-      (SELECT connection_id FROM conversations WHERE id=$4) AS conversation_connection,
-      (SELECT connection_id FROM conversations WHERE id=$5) AS ambiguous_conversation_connection,
-      (SELECT workspace_id FROM messages WHERE id=$6) AS message_workspace
-  `, [preflight.customer, preflight.ambiguousCustomer, preflight.dualCustomer, preflight.conversation, preflight.ambiguousConversation, preflight.message]);
+      (SELECT connection_id FROM customers WHERE id=$2) AS instagram_customer_connection,
+      (SELECT provider_user_id FROM customers WHERE id=$2) AS instagram_customer_provider,
+      (SELECT connection_id FROM customers WHERE id=$3) AS conflicting_customer_connection,
+      (SELECT provider_user_id FROM customers WHERE id=$3) AS conflicting_customer_provider,
+      (SELECT connection_id FROM customers WHERE id=$4) AS ambiguous_customer_connection,
+      (SELECT provider_user_id FROM customers WHERE id=$4) AS ambiguous_customer_provider,
+      (SELECT connection_id FROM customers WHERE id=$5) AS dual_customer_connection,
+      (SELECT connection_id FROM conversations WHERE id=$6) AS conversation_connection,
+      (SELECT connection_id FROM conversations WHERE id=$7) AS ambiguous_conversation_connection,
+      (SELECT workspace_id FROM messages WHERE id=$8) AS message_workspace
+  `, [preflight.customer, preflight.instagramCustomer, preflight.conflictingCustomer, preflight.ambiguousCustomer, preflight.dualCustomer, preflight.conversation, preflight.ambiguousConversation, preflight.message]);
   const result = preflightRows.rows[0];
   if (result.customer_connection !== preflight.connection || result.customer_provider !== 'provider-single' ||
+      result.instagram_customer_connection !== preflight.instagramConnection || result.instagram_customer_provider !== 'instagram-provider' ||
+      result.conflicting_customer_connection !== preflight.ambiguousConnection1 || result.conflicting_customer_provider !== null ||
       result.ambiguous_customer_connection !== null || result.ambiguous_customer_provider !== null ||
       result.dual_customer_connection !== null || result.conversation_connection !== preflight.connection ||
       result.ambiguous_conversation_connection !== null || result.message_workspace !== preflight.workspace) {
