@@ -1,8 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { MessageNormalizerService } from '@/lib/services/message-queue';
-import { AIIntelligenceService } from '@/lib/services/ai-intelligence';
 import { resolveActiveWebhookConnection } from '@/lib/services/webhook-connection-resolver';
 import { secretsMatch, verifyMetaSignature } from '@/lib/security/webhook-verification';
+import { insertProviderEvent } from '@/lib/services/provider-events';
 
 const forbidden = () => new Response('Forbidden', { status: 403 });
 const unauthorized = () => NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
@@ -38,8 +37,17 @@ export async function POST(req: NextRequest) {
     if (payload.object === 'instagram' || payload.object === 'page') {
       for (const entry of payload.entry ?? []) {
         for (const messagingEntry of entry.messaging ?? []) {
-          const normalized = MessageNormalizerService.normalizeInstagramMessage(connection.workspaceId, messagingEntry);
-          if (normalized) await AIIntelligenceService.processIncomingMessage(normalized);
+          // Ignore non-message items safely (Instagram requires messagingEntry.message.mid to exist)
+          if (messagingEntry && messagingEntry.message && typeof messagingEntry.message.mid === 'string') {
+            await insertProviderEvent({
+              workspaceId: connection.workspaceId,
+              connectionId: connection.id,
+              provider: 'instagram',
+              providerEventId: messagingEntry.message.mid,
+              payload: messagingEntry,
+              webhookIdentifier: identifier,
+            });
+          }
         }
       }
     }

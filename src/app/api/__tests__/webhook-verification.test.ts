@@ -4,23 +4,16 @@ import { createHmac } from 'node:crypto';
 
 const mocks = vi.hoisted(() => ({
   resolveActiveWebhookConnection: vi.fn(),
-  normalizeTelegramMessage: vi.fn(),
-  normalizeInstagramMessage: vi.fn(),
-  processIncomingMessage: vi.fn(),
-  dbQuery: vi.fn(),
+  insertProviderEvent: vi.fn(),
 }));
 
 vi.mock('@/lib/services/webhook-connection-resolver', () => ({
   resolveActiveWebhookConnection: mocks.resolveActiveWebhookConnection,
 }));
-vi.mock('@/lib/services/message-queue', () => ({ MessageNormalizerService: {
-  normalizeTelegramMessage: mocks.normalizeTelegramMessage,
-  normalizeInstagramMessage: mocks.normalizeInstagramMessage,
-} }));
-vi.mock('@/lib/services/ai-intelligence', () => ({
-  AIIntelligenceService: { processIncomingMessage: mocks.processIncomingMessage },
+
+vi.mock('@/lib/services/provider-events', () => ({
+  insertProviderEvent: mocks.insertProviderEvent,
 }));
-vi.mock('@/lib/db', () => ({ query: mocks.dbQuery, default: { connect: vi.fn() } }));
 
 import { POST as telegramPost } from '../webhooks/telegram/route';
 import { GET as instagramGet, POST as instagramPost } from '../webhooks/instagram/route';
@@ -50,10 +43,7 @@ const instagramConnection = {
 };
 
 function expectNoSideEffects() {
-  expect(mocks.normalizeTelegramMessage).not.toHaveBeenCalled();
-  expect(mocks.normalizeInstagramMessage).not.toHaveBeenCalled();
-  expect(mocks.processIncomingMessage).not.toHaveBeenCalled();
-  expect(mocks.dbQuery).not.toHaveBeenCalled();
+  expect(mocks.insertProviderEvent).not.toHaveBeenCalled();
   expect(fetchMock).not.toHaveBeenCalled();
 }
 
@@ -100,7 +90,6 @@ describe('Telegram webhook trust boundary', () => {
   });
 
   it('rejects an inactive connection identically to an unknown one', async () => {
-    // Resolver query filters is_active = TRUE, so inactive connections resolve to null.
     mocks.resolveActiveWebhookConnection.mockResolvedValueOnce(null);
     const req = new NextRequest(url, {
       method: 'POST',
@@ -114,8 +103,7 @@ describe('Telegram webhook trust boundary', () => {
 
   it('accepts a valid secret and derives the workspace from the resolved connection', async () => {
     mocks.resolveActiveWebhookConnection.mockResolvedValueOnce(telegramConnection);
-    mocks.normalizeTelegramMessage.mockReturnValueOnce({ workspaceId, channel: 'telegram', channelUserIdentifier: '1', content: 'hi', messageType: 'text', rawPayload: telegramUpdate });
-    mocks.processIncomingMessage.mockResolvedValueOnce(undefined);
+    mocks.insertProviderEvent.mockResolvedValueOnce({ id: 'event-123', status: 'received', isDuplicate: false });
 
     const req = new NextRequest(url, {
       method: 'POST',
@@ -125,8 +113,14 @@ describe('Telegram webhook trust boundary', () => {
     const res = await telegramPost(req);
 
     expect(res.status).toBe(200);
-    expect(mocks.normalizeTelegramMessage).toHaveBeenCalledWith(workspaceId, telegramUpdate);
-    expect(mocks.processIncomingMessage).toHaveBeenCalledTimes(1);
+    expect(mocks.insertProviderEvent).toHaveBeenCalledWith({
+      workspaceId,
+      connectionId: connectionId,
+      provider: 'telegram',
+      providerEventId: '1',
+      payload: telegramUpdate,
+      webhookIdentifier: telegramIdentifier,
+    });
   });
 });
 
@@ -185,17 +179,22 @@ describe('Instagram webhook POST trust boundary', () => {
 
   it('accepts a valid signature and derives the workspace from the resolved connection', async () => {
     mocks.resolveActiveWebhookConnection.mockResolvedValueOnce(instagramConnection);
-    mocks.normalizeInstagramMessage.mockReturnValueOnce({ workspaceId, channel: 'instagram', channelUserIdentifier: 'user-1', content: 'hi', messageType: 'text', rawPayload: {} });
-    mocks.processIncomingMessage.mockResolvedValueOnce(undefined);
+    mocks.insertProviderEvent.mockResolvedValueOnce({ id: 'event-456', status: 'received', isDuplicate: false });
 
     const sig = sign('correct-app-secret', rawBody);
     const req = new NextRequest(url, { method: 'POST', headers: { 'x-hub-signature-256': sig }, body: rawBody });
     const res = await instagramPost(req);
 
     expect(res.status).toBe(200);
-    expect(mocks.normalizeInstagramMessage).toHaveBeenCalledTimes(1);
-    expect(mocks.normalizeInstagramMessage.mock.calls[0][0]).toBe(workspaceId);
-    expect(mocks.processIncomingMessage).toHaveBeenCalledTimes(1);
+    expect(mocks.insertProviderEvent).toHaveBeenCalledTimes(1);
+    expect(mocks.insertProviderEvent).toHaveBeenCalledWith({
+      workspaceId,
+      connectionId: connectionId,
+      provider: 'instagram',
+      providerEventId: 'm1',
+      payload: { sender: { id: 'user-1' }, recipient: { id: 'page-1' }, timestamp: 0, message: { mid: 'm1', text: 'hi' } },
+      webhookIdentifier: instagramIdentifier,
+    });
   });
 });
 

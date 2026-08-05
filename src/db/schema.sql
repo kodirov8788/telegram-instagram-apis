@@ -72,8 +72,31 @@ CREATE TABLE IF NOT EXISTS channel_connections (
     credentials JSONB NOT NULL, -- Encrypted tokens/keys
     is_active BOOLEAN DEFAULT TRUE,
     last_synced_at TIMESTAMP WITH TIME ZONE,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    UNIQUE(id, workspace_id),
+    UNIQUE(id, workspace_id, channel)
 );
+
+-- 4.1. Provider Events
+CREATE TABLE IF NOT EXISTS provider_events (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    connection_id UUID NOT NULL,
+    provider channel_type NOT NULL,
+    provider_event_id VARCHAR(255) NOT NULL,
+    payload JSONB NOT NULL,
+    payload_hash CHAR(64) NOT NULL,
+    status VARCHAR(50) NOT NULL DEFAULT 'received',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    processed_at TIMESTAMP WITH TIME ZONE,
+    last_error TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    CONSTRAINT provider_events_status_check CHECK (status IN ('received', 'queued', 'processing', 'processed', 'retryable_failed', 'permanent_failed')),
+    CONSTRAINT provider_events_connection_tenant_fk FOREIGN KEY (connection_id, workspace_id, provider) REFERENCES channel_connections(id, workspace_id, channel) ON DELETE CASCADE,
+    CONSTRAINT provider_events_connection_event_unique UNIQUE (connection_id, provider_event_id)
+);
+
 
 -- 5. Customers
 CREATE TABLE IF NOT EXISTS customers (
@@ -203,6 +226,8 @@ CREATE INDEX IF NOT EXISTS idx_user_sessions_user ON user_sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_workspace_invitations_workspace ON workspace_invitations(workspace_id);
 CREATE UNIQUE INDEX IF NOT EXISTS workspace_invitations_one_live_email ON workspace_invitations(workspace_id, lower(email)) WHERE accepted_at IS NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS channel_connections_webhook_identifier_unique ON channel_connections(webhook_identifier);
+CREATE INDEX IF NOT EXISTS idx_provider_events_status ON provider_events(status);
+CREATE INDEX IF NOT EXISTS idx_provider_events_workspace_id ON provider_events(workspace_id);
 
 -- Supabase/PostgREST defense in depth. Direct clients cannot select another tenant.
 CREATE OR REPLACE FUNCTION current_user_is_workspace_member(target UUID)
@@ -215,6 +240,7 @@ ALTER TABLE workspaces ENABLE ROW LEVEL SECURITY;
 ALTER TABLE workspace_members ENABLE ROW LEVEL SECURITY;
 ALTER TABLE workspace_invitations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE channel_connections ENABLE ROW LEVEL SECURITY;
+ALTER TABLE provider_events ENABLE ROW LEVEL SECURITY;
 ALTER TABLE customers ENABLE ROW LEVEL SECURITY;
 ALTER TABLE conversations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE messages ENABLE ROW LEVEL SECURITY;
@@ -223,10 +249,15 @@ ALTER TABLE knowledge_items ENABLE ROW LEVEL SECURITY;
 ALTER TABLE follow_up_rules ENABLE ROW LEVEL SECURITY;
 ALTER TABLE audit_logs ENABLE ROW LEVEL SECURITY;
 
+-- Policy target roles must exist before CREATE POLICY references them.
+DO $$ BEGIN IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='ydeck_tenant_runtime_v2') THEN CREATE ROLE ydeck_tenant_runtime_v2 NOLOGIN NOINHERIT NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION; END IF; END $$;
+
 DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='workspaces' AND policyname='workspace_tenant_policy') THEN CREATE POLICY workspace_tenant_policy ON workspaces USING (current_user_is_workspace_member(id)) WITH CHECK (current_user_is_workspace_member(id)); END IF; END $$;
 DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='workspace_members' AND policyname='member_tenant_policy') THEN CREATE POLICY member_tenant_policy ON workspace_members USING (current_user_is_workspace_member(workspace_id)) WITH CHECK (current_user_is_workspace_member(workspace_id)); END IF; END $$;
 DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='workspace_invitations' AND policyname='invitation_tenant_policy') THEN CREATE POLICY invitation_tenant_policy ON workspace_invitations USING (current_user_is_workspace_member(workspace_id)) WITH CHECK (current_user_is_workspace_member(workspace_id)); END IF; END $$;
 DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='channel_connections' AND policyname='channel_tenant_policy') THEN CREATE POLICY channel_tenant_policy ON channel_connections USING (current_user_is_workspace_member(workspace_id)) WITH CHECK (current_user_is_workspace_member(workspace_id)); END IF; END $$;
+DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='provider_events' AND policyname='provider_event_tenant_policy') THEN CREATE POLICY provider_event_tenant_policy ON provider_events USING (current_user_is_workspace_member(workspace_id)) WITH CHECK (current_user_is_workspace_member(workspace_id)); END IF; END $$;
+DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='provider_events' AND policyname='provider_event_webhook_policy') THEN CREATE POLICY provider_event_webhook_policy ON provider_events TO ydeck_tenant_runtime_v2 USING (provider::TEXT = NULLIF(current_setting('app.webhook_provider', true), '') AND connection_id IN (SELECT id FROM public.channel_connections WHERE is_active IS TRUE AND webhook_identifier = NULLIF(current_setting('app.webhook_identifier', true), '')::UUID AND channel::TEXT = NULLIF(current_setting('app.webhook_provider', true), ''))) WITH CHECK (provider::TEXT = NULLIF(current_setting('app.webhook_provider', true), '') AND connection_id IN (SELECT id FROM public.channel_connections WHERE is_active IS TRUE AND webhook_identifier = NULLIF(current_setting('app.webhook_identifier', true), '')::UUID AND channel::TEXT = NULLIF(current_setting('app.webhook_provider', true), ''))); END IF; END $$;
 DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='customers' AND policyname='customer_tenant_policy') THEN CREATE POLICY customer_tenant_policy ON customers USING (current_user_is_workspace_member(workspace_id)) WITH CHECK (current_user_is_workspace_member(workspace_id)); END IF; END $$;
 DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='conversations' AND policyname='conversation_tenant_policy') THEN CREATE POLICY conversation_tenant_policy ON conversations USING (current_user_is_workspace_member(workspace_id)) WITH CHECK (current_user_is_workspace_member(workspace_id)); END IF; END $$;
 DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='messages' AND policyname='message_tenant_policy') THEN CREATE POLICY message_tenant_policy ON messages USING (EXISTS(SELECT 1 FROM public.conversations c WHERE c.id=conversation_id AND public.current_user_is_workspace_member(c.workspace_id))) WITH CHECK (EXISTS(SELECT 1 FROM public.conversations c WHERE c.id=conversation_id AND public.current_user_is_workspace_member(c.workspace_id))); END IF; END $$;
@@ -239,17 +270,17 @@ DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' A
 -- Fresh-install equivalents of migration 002 integrity and runtime-role controls.
 DO $$ BEGIN
  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='customers_id_workspace_unique' AND conrelid='public.customers'::regclass) THEN ALTER TABLE customers ADD CONSTRAINT customers_id_workspace_unique UNIQUE(id,workspace_id); END IF;
- IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='conversations_id_workspace_unique' AND conrelid='public.conversations'::regclass) THEN ALTER TABLE conversations ADD CONSTRAINT conversations_id_workspace_unique UNIQUE(id,workspace_id); END IF;
- IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='conversations_customer_tenant_fk' AND conrelid='public.conversations'::regclass) THEN ALTER TABLE conversations ADD CONSTRAINT conversations_customer_tenant_fk FOREIGN KEY(customer_id,workspace_id) REFERENCES customers(id,workspace_id); END IF;
- IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='leads_customer_tenant_fk' AND conrelid='public.leads'::regclass) THEN ALTER TABLE leads ADD CONSTRAINT leads_customer_tenant_fk FOREIGN KEY(customer_id,workspace_id) REFERENCES customers(id,workspace_id); END IF;
- IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='leads_conversation_tenant_fk' AND conrelid='public.leads'::regclass) THEN ALTER TABLE leads ADD CONSTRAINT leads_conversation_tenant_fk FOREIGN KEY(conversation_id,workspace_id) REFERENCES conversations(id,workspace_id); END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='conversations_id_workspace_unique' AND conrelid='public.conversations'::regclass) THEN ALTER TABLE conversations ADD CONSTRAINT conversations_id_workspace_unique UNIQUE(id,workspace_id); END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='conversations_customer_tenant_fk' AND conrelid='public.conversations'::regclass) THEN ALTER TABLE conversations ADD CONSTRAINT conversations_customer_tenant_fk FOREIGN KEY(customer_id,workspace_id) REFERENCES customers(id,workspace_id); END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='leads_customer_tenant_fk' AND conrelid='public.leads'::regclass) THEN ALTER TABLE leads ADD CONSTRAINT leads_customer_tenant_fk FOREIGN KEY(customer_id,workspace_id) REFERENCES customers(id,workspace_id); END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='leads_conversation_tenant_fk' AND conrelid='public.leads'::regclass) THEN ALTER TABLE leads ADD CONSTRAINT leads_conversation_tenant_fk FOREIGN KEY(conversation_id,workspace_id) REFERENCES conversations(id,workspace_id); END IF;
 END $$;
-DO $$ BEGIN IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='ydeck_tenant_runtime_v2') THEN CREATE ROLE ydeck_tenant_runtime_v2 NOLOGIN NOINHERIT NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION; END IF; END $$;
 DO $$ BEGIN IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname='ydeck_tenant_runtime_v2' AND (rolcanlogin OR rolinherit OR rolsuper OR rolbypassrls OR rolcreatedb OR rolcreaterole OR rolreplication)) THEN RAISE EXCEPTION 'unsafe attributes on ydeck_tenant_runtime_v2'; END IF; END $$;
 GRANT ydeck_tenant_runtime_v2 TO CURRENT_USER;
 REVOKE ALL ON FUNCTION current_user_is_workspace_member(UUID) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION current_user_is_workspace_member(UUID) TO ydeck_tenant_runtime_v2;
 GRANT SELECT,INSERT,UPDATE,DELETE ON workspaces,workspace_members,workspace_invitations,channel_connections,customers,conversations,messages,leads,knowledge_items,follow_up_rules,audit_logs TO ydeck_tenant_runtime_v2;
+GRANT SELECT,INSERT ON provider_events TO ydeck_tenant_runtime_v2;
 DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='channel_connections' AND policyname='channel_webhook_resolution_policy') THEN CREATE POLICY channel_webhook_resolution_policy ON channel_connections FOR SELECT TO ydeck_tenant_runtime_v2 USING (is_active IS TRUE AND webhook_identifier = NULLIF(current_setting('app.webhook_identifier', true), '')::UUID AND channel::TEXT = NULLIF(current_setting('app.webhook_provider', true), '')); END IF; END $$;
 CREATE OR REPLACE FUNCTION bootstrap_workspace(p_name TEXT, p_industry TEXT, p_time_zone TEXT, p_default_language TEXT, p_working_hours JSONB)
 RETURNS SETOF public.workspaces LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,public AS $fn$
@@ -278,4 +309,4 @@ REVOKE ALL ON FUNCTION bootstrap_workspace(TEXT,TEXT,TEXT,TEXT,JSONB) FROM PUBLI
 REVOKE ALL ON FUNCTION accept_workspace_invitation(TEXT) FROM PUBLIC;
 -- Bootstrap SECURITY DEFINER functions and the membership predicate must owner-bypass
 -- these three tables; the non-owner runtime role remains subject to their enabled RLS.
-DO $$ DECLARE t text; BEGIN FOREACH t IN ARRAY ARRAY['channel_connections','customers','conversations','messages','leads','knowledge_items','follow_up_rules','audit_logs'] LOOP EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY',t); END LOOP; END $$;
+DO $$ DECLARE t text; BEGIN FOREACH t IN ARRAY ARRAY['channel_connections','provider_events','customers','conversations','messages','leads','knowledge_items','follow_up_rules','audit_logs'] LOOP EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY',t); END LOOP; END $$;
