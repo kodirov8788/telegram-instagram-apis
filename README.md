@@ -81,8 +81,7 @@ runner restriction is resolved.
 
 ## Database deployment
 
-Apply `src/db/schema.sql` for fresh databases, or apply
-`src/db/migrations/002_auth_rbac_rls.sql` to the baseline schema, using the same
+Apply `src/db/schema.sql` for fresh databases, or apply migrations in sequence (from `002_auth_rbac_rls.sql` through `008_worker_queue_role.sql`) to the baseline schema, using the same
 login configured in `DATABASE_URL`. The migration creates the fixed
 `ydeck_tenant_runtime_v2` role as `NOLOGIN NOINHERIT` and grants that role to the
 current migration login so runtime `SET LOCAL ROLE` works. The migration login

@@ -177,6 +177,8 @@ CREATE TABLE IF NOT EXISTS outbound_jobs (
     conversation_id UUID NOT NULL,
     message_id UUID NOT NULL,
     idempotency_key TEXT NOT NULL,
+    provider channel_type NOT NULL,
+    recipient_id TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','queued','processing','retryable_failed','sent','permanent_failed','cancelled')),
     attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
     next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -191,6 +193,8 @@ CREATE TABLE IF NOT EXISTS outbound_jobs (
     CONSTRAINT outbound_jobs_workspace_idempotency_unique UNIQUE(workspace_id,idempotency_key),
     CONSTRAINT outbound_jobs_message_unique UNIQUE(message_id)
 );
+CREATE UNIQUE INDEX IF NOT EXISTS outbound_jobs_provider_ack_unique
+  ON outbound_jobs(connection_id,provider_message_id) WHERE provider_message_id IS NOT NULL;
 
 -- 8. Leads
 DO $$ BEGIN CREATE TYPE lead_status AS ENUM ('unqualified', 'new_lead', 'interested', 'qualified', 'high_priority', 'not_interested', 'customer', 'lost'); EXCEPTION WHEN duplicate_object THEN NULL; END $$;
@@ -267,8 +271,8 @@ CREATE INDEX IF NOT EXISTS idx_provider_events_status ON provider_events(status)
 CREATE INDEX IF NOT EXISTS idx_provider_events_workspace_id ON provider_events(workspace_id);
 CREATE INDEX IF NOT EXISTS idx_provider_events_recovery ON provider_events(status,updated_at) WHERE status IN ('received','queued','processing','retryable_failed');
 CREATE UNIQUE INDEX IF NOT EXISTS conversations_one_open_per_connection_customer ON conversations(connection_id,customer_id) WHERE status NOT IN ('resolved','closed','spam');
-CREATE UNIQUE INDEX IF NOT EXISTS messages_provider_message_unique ON messages(workspace_id,provider_message_id) WHERE provider_message_id IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_messages_provider_event ON messages(provider_event_id) WHERE provider_event_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_messages_provider_message ON messages(workspace_id,provider_message_id) WHERE provider_message_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS messages_provider_event_unique ON messages(provider_event_id) WHERE provider_event_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_messages_parent ON messages(parent_message_id) WHERE parent_message_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_outbound_jobs_claim ON outbound_jobs(next_attempt_at,created_at) WHERE status IN ('pending','queued','retryable_failed');
 CREATE INDEX IF NOT EXISTS idx_outbound_jobs_conversation ON outbound_jobs(conversation_id,created_at DESC);

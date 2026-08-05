@@ -19,6 +19,14 @@ export interface VaultSecretReader {
   read(reference: string): Promise<Record<string, unknown> | null>;
 }
 
+export class ConnectionCredentialError extends Error {
+  readonly retryable = false;
+  constructor(message: string) {
+    super(message);
+    this.name = 'ConnectionCredentialError';
+  }
+}
+
 export class DatabaseSecretProvider implements SecretProvider {
   constructor(private readonly db: DbClient, private readonly vault?: VaultSecretReader) {}
 
@@ -29,7 +37,7 @@ export class DatabaseSecretProvider implements SecretProvider {
       [input.connectionId, input.workspaceId, input.provider]
     );
     const credentials = result.rows[0]?.credentials as Record<string, unknown> | undefined;
-    if (!credentials) throw new Error('Active channel connection not found');
+    if (!credentials) throw new ConnectionCredentialError('Active channel connection not found');
 
     const reference = typeof credentials.vault_ref === 'string' ? credentials.vault_ref : undefined;
     const resolved = reference && this.vault ? await this.vault.read(reference) : credentials;
@@ -37,7 +45,7 @@ export class DatabaseSecretProvider implements SecretProvider {
       resolved.access_token ?? resolved.bot_token ?? resolved.page_access_token ?? resolved.token
     );
     if (typeof accessToken !== 'string' || !accessToken) {
-      throw new Error('Connection credential is unavailable');
+      throw new ConnectionCredentialError('Connection credential is unavailable');
     }
     return { accessToken };
   }

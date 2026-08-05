@@ -83,9 +83,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS conversations_one_open_per_connection_customer
   ON public.conversations(connection_id, customer_id)
   WHERE connection_id IS NOT NULL AND status NOT IN ('resolved','closed','spam');
 
-CREATE UNIQUE INDEX IF NOT EXISTS messages_provider_message_unique
+DROP INDEX IF EXISTS public.messages_provider_message_unique;
+CREATE INDEX IF NOT EXISTS idx_messages_provider_message
   ON public.messages(workspace_id, provider_message_id) WHERE provider_message_id IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_messages_provider_event ON public.messages(provider_event_id) WHERE provider_event_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS messages_provider_event_unique ON public.messages(provider_event_id) WHERE provider_event_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_messages_parent ON public.messages(parent_message_id) WHERE parent_message_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_provider_events_recovery ON public.provider_events(status, updated_at)
   WHERE status IN ('received','queued','processing','retryable_failed');
@@ -97,6 +98,8 @@ CREATE TABLE IF NOT EXISTS public.outbound_jobs (
   conversation_id UUID NOT NULL,
   message_id UUID NOT NULL,
   idempotency_key TEXT NOT NULL,
+  provider public.channel_type NOT NULL,
+  recipient_id TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'pending',
   attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
   next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -117,6 +120,8 @@ CREATE TABLE IF NOT EXISTS public.outbound_jobs (
 CREATE INDEX IF NOT EXISTS idx_outbound_jobs_claim ON public.outbound_jobs(next_attempt_at, created_at)
   WHERE status IN ('pending','queued','retryable_failed');
 CREATE INDEX IF NOT EXISTS idx_outbound_jobs_conversation ON public.outbound_jobs(conversation_id, created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS outbound_jobs_provider_ack_unique
+  ON public.outbound_jobs(connection_id, provider_message_id) WHERE provider_message_id IS NOT NULL;
 
 ALTER TABLE public.outbound_jobs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.outbound_jobs FORCE ROW LEVEL SECURITY;

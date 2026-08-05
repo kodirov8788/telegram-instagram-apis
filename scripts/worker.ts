@@ -1,7 +1,4 @@
 import { runWorker } from '../src/lib/workers/runtime';
-// The processor module is supplied by the processing layer; this entrypoint owns
-// only queue lifecycle and dispatch.
-// @ts-ignore -- processors are integrated as a separate runtime component.
 import { processInboundEvent, processOutboundJob } from '../src/lib/workers/processors';
 
 const controller = new AbortController();

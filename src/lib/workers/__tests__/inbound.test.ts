@@ -23,7 +23,7 @@ describe('processInboundEvent', () => {
       throw new Error('sensitive upstream response');
     });
 
-    await expect(processInboundEvent('event', { transaction, analyze })).resolves.toEqual({ outcome: 'retryable_failed' });
+    await expect(processInboundEvent('event', { transaction, analyze })).rejects.toThrow('retryable');
     expect(order).toEqual(['tx1:begin', 'tx1:commit', 'analyze', 'tx2:begin', 'tx2:commit']);
   });
 });

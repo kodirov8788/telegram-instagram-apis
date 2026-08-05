@@ -32,7 +32,7 @@ describe('processOutboundJob', () => {
 
   it('honors provider retry-after without marking the message failed', async () => {
     const h = harness(async () => { throw new TelegramProviderError('Telegram request failed (429)', true, 12_000); });
-    await expect(processOutboundJob('job', h.secrets, { ...h, random: () => 0 })).resolves.toEqual({ outcome: 'retryable_failed', retryInMs: 12_000 });
+    await expect(processOutboundJob('job', h.secrets, { ...h, random: () => 0 })).rejects.toThrow('retryable');
     const retry = h.queries.find(q => q.text.includes("next_attempt_at = CASE"));
     expect(retry?.params).toEqual(['job', 'retryable_failed', 'Telegram request failed (429)', 12_000]);
     expect(h.queries.some(q => q.text.includes("delivery_status = 'failed'"))).toBe(false);

@@ -2,10 +2,11 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { TestQueueAdapter } from '@/lib/queue/test-adapter';
 import { processWorkerBatch } from '../runtime';
 import type { DbClient } from '@/lib/db';
+import { RetryableWorkError } from '../errors';
 
 const mocks = vi.hoisted(() => ({ transaction: vi.fn() }));
 vi.mock('@/lib/db', () => ({
-  runtimeRoleTransaction: mocks.transaction,
+  queueWorkerTransaction: mocks.transaction,
 }));
 
 const client: DbClient = { query: vi.fn(async () => ({ rows: [] })) };
@@ -57,5 +58,19 @@ describe('worker runtime', () => {
       logger: { info: vi.fn(), error: vi.fn() },
     });
     expect(adapter.getMessages()[0].archived).toBe(true);
+  });
+
+  it('atomically replaces retryable work with a delayed queue item', async () => {
+    const adapter = new TestQueueAdapter();
+    const id = 'd78a9cde-1234-4678-90ab-cdef12345678';
+    await adapter.send(client, 'outbound_messages', { v: 1, outboundJobId: id });
+    await processWorkerBatch({
+      queue: 'outbound_messages', adapter,
+      process: vi.fn().mockRejectedValue(new RetryableWorkError(12_000)),
+    });
+    expect(adapter.getMessages().filter(message => message.deleted)).toHaveLength(1);
+    const replacement = adapter.getMessages().find(message => !message.deleted);
+    expect(replacement?.payload).toEqual({ v: 1, outboundJobId: id });
+    expect(replacement!.visibleAt.getTime()).toBeGreaterThan(Date.now() + 10_000);
   });
 });

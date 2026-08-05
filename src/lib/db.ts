@@ -58,3 +58,18 @@ export async function runtimeRoleTransaction<T>(operation: (client: DbClient) =>
     throw error;
   } finally { client.release(); }
 }
+
+/** Queue-only transaction. Data access is scoped separately by worker transactions. */
+export async function queueWorkerTransaction<T>(operation: (client: DbClient) => Promise<T>): Promise<T> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('SET LOCAL ROLE ydeck_queue_worker_v1');
+    const value = await operation(client);
+    await client.query('COMMIT');
+    return value;
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally { client.release(); }
+}

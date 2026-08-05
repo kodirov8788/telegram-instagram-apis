@@ -1,8 +1,9 @@
 import { InstagramProviderError, InstagramService } from '../../services/instagram';
-import { Provider, SecretProvider } from '../../services/secret-provider';
+import { ConnectionCredentialError, Provider, SecretProvider } from '../../services/secret-provider';
 import { TelegramProviderError, TelegramService } from '../../services/telegram';
 import { MAX_DELIVERY_ATTEMPTS, retryDelayMs } from '../retry';
-import { TransactionRunner, runWorkerTransaction } from '../transaction';
+import { TransactionRunner, workerRecordTransaction } from '../transaction';
+import { RetryableWorkError } from '../errors';
 
 interface OutboundJob {
   id: string;
@@ -35,18 +36,28 @@ export async function processOutboundJob(
   secrets: SecretProvider,
   dependencies: { transaction?: TransactionRunner; sender?: ProviderSender; random?: () => number } = {}
 ) {
-  const transaction = dependencies.transaction ?? runWorkerTransaction;
+  const transaction = dependencies.transaction ?? workerRecordTransaction('outbound_jobs', outboundJobId);
   const job = await transaction(async db => {
     const result = await db.query(
-      `UPDATE outbound_jobs j SET status = 'processing', attempts = attempts + 1
+      `UPDATE outbound_jobs j SET status = 'processing', attempts = attempts + 1, locked_at = NOW(), updated_at = NOW()
        FROM messages m WHERE j.id = $1 AND j.message_id = m.id
-       AND j.status IN ('pending', 'retryable_failed') AND j.next_attempt_at <= NOW()
+       AND ((j.status IN ('pending', 'queued', 'retryable_failed') AND j.next_attempt_at <= NOW())
+         OR (j.status = 'processing' AND j.locked_at < NOW() - INTERVAL '10 minutes'))
        RETURNING j.*, m.content`,
       [outboundJobId]
     );
     return result.rows[0] as OutboundJob | undefined;
   });
-  if (!job) return { outcome: 'ignored' as const };
+  if (!job) {
+    const pending = await transaction(db => db.query(
+      "SELECT status, GREATEST(0, EXTRACT(EPOCH FROM (next_attempt_at - NOW())) * 1000)::bigint AS delay_ms FROM outbound_jobs WHERE id=$1",
+      [outboundJobId]
+    ));
+    if (['pending', 'queued', 'processing', 'retryable_failed'].includes(pending.rows[0]?.status)) {
+      throw new RetryableWorkError(Number(pending.rows[0]?.delay_ms || 5_000), 'Outbound job is not claimable yet');
+    }
+    return { outcome: 'ignored' as const };
+  }
 
   try {
     const secret = await secrets.getConnectionSecret({
@@ -55,15 +66,17 @@ export async function processOutboundJob(
     const ack = await (dependencies.sender ?? defaultSender).send(job.provider, secret.accessToken, job.recipient_id, job.content);
     await transaction(async db => {
       await db.query(
-        `UPDATE outbound_jobs SET status = 'sent', provider_message_id = $2, last_error = NULL WHERE id = $1`,
+        `UPDATE outbound_jobs SET status = 'sent', provider_message_id = $2, last_error = NULL,
+          sent_at = NOW(), locked_at = NULL, updated_at = NOW() WHERE id = $1`,
         [job.id, ack.providerMessageId]
       );
       await db.query("UPDATE messages SET delivery_status = 'sent' WHERE id = $1", [job.message_id]);
+      await db.query("UPDATE messages SET provider_message_id = $2 WHERE id = $1", [job.message_id, ack.providerMessageId]);
     });
     return { outcome: 'sent' as const };
   } catch (error) {
     const providerError = error instanceof TelegramProviderError || error instanceof InstagramProviderError ? error : undefined;
-    const permanent = providerError ? !providerError.retryable : job.attempts >= MAX_DELIVERY_ATTEMPTS;
+    const permanent = error instanceof ConnectionCredentialError || job.attempts >= MAX_DELIVERY_ATTEMPTS || (providerError ? !providerError.retryable : false);
     const delay = retryDelayMs(job.attempts, providerError?.retryAfterMs, dependencies.random);
     await transaction(async db => {
       await db.query(
@@ -74,7 +87,8 @@ export async function processOutboundJob(
       );
       if (permanent) await db.query("UPDATE messages SET delivery_status = 'failed' WHERE id = $1", [job.message_id]);
     });
-    return { outcome: permanent ? 'permanent_failed' as const : 'retryable_failed' as const, retryInMs: permanent ? undefined : delay };
+    if (!permanent) throw new RetryableWorkError(delay, 'Outbound delivery is retryable');
+    return { outcome: 'permanent_failed' as const };
   }
 }
 
