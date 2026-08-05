@@ -43,3 +43,18 @@ export async function tenantTransaction<T>(userId: string, operation: (client: D
     throw error;
   } finally { client.release(); }
 }
+
+/** Runs under the narrowly privileged runtime role without an authenticated user. */
+export async function runtimeRoleTransaction<T>(operation: (client: DbClient) => Promise<T>): Promise<T> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('SET LOCAL ROLE ydeck_tenant_runtime_v2');
+    const value = await operation(client);
+    await client.query('COMMIT');
+    return value;
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally { client.release(); }
+}

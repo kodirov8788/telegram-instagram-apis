@@ -47,15 +47,18 @@ try {
   await db.query(`SET ROLE ${qi(login)}`);
   const schema = await readFile(new URL('../src/db/schema.sql', import.meta.url), 'utf8');
   const migration = await readFile(new URL('../src/db/migrations/002_auth_rbac_rls.sql', import.meta.url), 'utf8');
+  const migration003 = await readFile(new URL('../src/db/migrations/003_webhook_connection_resolution.sql', import.meta.url), 'utf8');
   await db.query(schema);
   await db.query(migration);
   await db.query(migration); // idempotency
+  await db.query(migration003);
+  await db.query(migration003); // idempotency
   await db.query('RESET ROLE');
 
   const attrs = (await db.query('SELECT rolcanlogin,rolinherit,rolsuper,rolbypassrls,rolcreatedb,rolcreaterole,rolreplication FROM pg_roles WHERE rolname=$1', [runtimeRole])).rows[0];
   if (!attrs || attrs.rolcanlogin || attrs.rolinherit || attrs.rolsuper || attrs.rolbypassrls || attrs.rolcreatedb || attrs.rolcreaterole || attrs.rolreplication) throw new Error('runtime role retained dangerous attributes');
 
-  const ids = { u1: randomUUID(), u2: randomUUID(), u3: randomUUID(), w1: '', w2: randomUUID(), c1: randomUUID(), c2: randomUUID(), v1: randomUUID(), v2: randomUUID() };
+  const ids = { u1: randomUUID(), u2: randomUUID(), u3: randomUUID(), w1: '', w2: randomUUID(), c1: randomUUID(), c2: randomUUID(), v1: randomUUID(), v2: randomUUID(), telegramWebhook: randomUUID(), inactiveWebhook: randomUUID() };
   await db.query("INSERT INTO users(id,email,full_name) VALUES($1,'one@test.invalid','One'),($2,'two@test.invalid','Two'),($3,'invitee@test.invalid','Invitee')", [ids.u1,ids.u2,ids.u3]);
   await db.query(`SET ROLE ${qi(login)}`);
   await db.query('BEGIN'); await db.query("SELECT set_config('app.user_id',$1,true)", [ids.u1]);
@@ -65,6 +68,7 @@ try {
   await db.query('COMMIT'); await db.query('RESET ROLE');
   await db.query("INSERT INTO workspaces(id,name) VALUES($1,'Two')", [ids.w2]);
   await db.query("INSERT INTO workspace_members(workspace_id,user_id,role) VALUES($1,$2,'owner')", [ids.w2,ids.u2]);
+  await db.query("INSERT INTO channel_connections(workspace_id,channel,account_identifier,credentials,is_active,webhook_identifier) VALUES($1,'telegram','bot-one','{}',TRUE,$2),($3,'instagram','page-two','{}',FALSE,$4)", [ids.w1,ids.telegramWebhook,ids.w2,ids.inactiveWebhook]);
   await expectCount(db, `SELECT count(*) FROM workspace_members WHERE workspace_id='${ids.w1}' AND user_id='${ids.u1}' AND role='owner'`, 1, 'workspace bootstrap owner membership');
 
   const invitationHash = 'a'.repeat(64);
@@ -90,8 +94,16 @@ try {
   await expectCount(tx, 'SELECT count(*) FROM messages', 1, 'cross-tenant message read');
   await tx.query('ROLLBACK'); tx.release(); tx = undefined;
   reused = await pool.connect();
-  const state = await reused.query("SELECT current_role, current_setting('app.user_id',true) AS uid");
-  if (state.rows[0].current_role === runtimeRole || state.rows[0].uid) throw new Error('transaction-local role/GUC leaked after rollback/pool reuse');
+  const state = await reused.query("SELECT current_role, current_setting('app.user_id',true) AS uid, current_setting('app.webhook_identifier',true) AS wid, current_setting('app.webhook_provider',true) AS provider");
+  if (state.rows[0].current_role === runtimeRole || state.rows[0].uid || state.rows[0].wid || state.rows[0].provider) throw new Error('transaction-local role/GUC leaked after rollback/pool reuse');
+  await reused.query('BEGIN'); await reused.query(`SET LOCAL ROLE ${qi(runtimeRole)}`);
+  await reused.query("SELECT set_config('app.webhook_identifier',$1,true),set_config('app.webhook_provider','telegram',true)",[ids.telegramWebhook]);
+  await expectCount(reused,'SELECT count(*) FROM channel_connections',1,'matching webhook connection visibility');
+  await reused.query("SELECT set_config('app.webhook_provider','instagram',true)");
+  await expectCount(reused,'SELECT count(*) FROM channel_connections',0,'wrong-provider webhook visibility');
+  await reused.query("SELECT set_config('app.webhook_identifier',$1,true),set_config('app.webhook_provider','instagram',true)",[ids.inactiveWebhook]);
+  await expectCount(reused,'SELECT count(*) FROM channel_connections',0,'inactive webhook visibility');
+  await reused.query('ROLLBACK');
   await reused.query('BEGIN'); await reused.query(`SET LOCAL ROLE ${qi(runtimeRole)}`); await reused.query("SELECT set_config('app.user_id',$1,true)",[ids.u1]);
   await expectCount(reused, 'SELECT count(*) FROM messages', 1, 'message RLS after pool reuse');
   let denied = false;

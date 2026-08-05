@@ -66,6 +66,7 @@ DO $$ BEGIN CREATE TYPE channel_type AS ENUM ('telegram', 'instagram'); EXCEPTIO
 CREATE TABLE IF NOT EXISTS channel_connections (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    webhook_identifier UUID NOT NULL DEFAULT uuid_generate_v4(),
     channel channel_type NOT NULL,
     account_identifier VARCHAR(255) NOT NULL, -- Bot username or IG Business Account ID
     credentials JSONB NOT NULL, -- Encrypted tokens/keys
@@ -201,6 +202,7 @@ CREATE INDEX IF NOT EXISTS idx_knowledge_items_workspace ON knowledge_items(work
 CREATE INDEX IF NOT EXISTS idx_user_sessions_user ON user_sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_workspace_invitations_workspace ON workspace_invitations(workspace_id);
 CREATE UNIQUE INDEX IF NOT EXISTS workspace_invitations_one_live_email ON workspace_invitations(workspace_id, lower(email)) WHERE accepted_at IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS channel_connections_webhook_identifier_unique ON channel_connections(webhook_identifier);
 
 -- Supabase/PostgREST defense in depth. Direct clients cannot select another tenant.
 CREATE OR REPLACE FUNCTION current_user_is_workspace_member(target UUID)
@@ -248,6 +250,7 @@ GRANT ydeck_tenant_runtime_v2 TO CURRENT_USER;
 REVOKE ALL ON FUNCTION current_user_is_workspace_member(UUID) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION current_user_is_workspace_member(UUID) TO ydeck_tenant_runtime_v2;
 GRANT SELECT,INSERT,UPDATE,DELETE ON workspaces,workspace_members,workspace_invitations,channel_connections,customers,conversations,messages,leads,knowledge_items,follow_up_rules,audit_logs TO ydeck_tenant_runtime_v2;
+DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='channel_connections' AND policyname='channel_webhook_resolution_policy') THEN CREATE POLICY channel_webhook_resolution_policy ON channel_connections FOR SELECT TO ydeck_tenant_runtime_v2 USING (is_active IS TRUE AND webhook_identifier = NULLIF(current_setting('app.webhook_identifier', true), '')::UUID AND channel::TEXT = NULLIF(current_setting('app.webhook_provider', true), '')); END IF; END $$;
 CREATE OR REPLACE FUNCTION bootstrap_workspace(p_name TEXT, p_industry TEXT, p_time_zone TEXT, p_default_language TEXT, p_working_hours JSONB)
 RETURNS SETOF public.workspaces LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,public AS $fn$
 DECLARE actor UUID; created public.workspaces%ROWTYPE;
