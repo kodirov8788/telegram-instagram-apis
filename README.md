@@ -78,10 +78,17 @@ npm audit --audit-level=high
 
 Apply `src/db/schema.sql` for fresh databases, or apply
 `src/db/migrations/002_auth_rbac_rls.sql` and then
-`src/db/migrations/006_inbound_data_preflight.sql` to the baseline schema, using the same
+`src/db/migrations/006_inbound_data_preflight.sql`,
+`src/db/migrations/007_connection_scoped_customer_identity.sql`, and
+`src/db/migrations/008_active_conversation_integrity.sql` in order, using the same
 login configured in `DATABASE_URL`. The migration creates the fixed
 `ydeck_tenant_runtime_v2` role as `NOLOGIN NOINHERIT` and grants that role to the
 current migration login so runtime `SET LOCAL ROLE` works. The migration login
 therefore needs `CREATEROLE` when the role does not exist; if the role is
 pre-provisioned, it needs admin option on that role. Do not give the runtime
 role a password, `LOGIN`, `INHERIT`, `BYPASSRLS`, or table ownership.
+
+Migration 008 stops with aggregate-only counts when active conversations conflict or references
+are inconsistent. Inspect affected groups with privileged, access-controlled queries and reconcile
+them from authoritative connection/customer records; never auto-delete or merge conversations.
+Rerun the migration only after all reported counts are zero.

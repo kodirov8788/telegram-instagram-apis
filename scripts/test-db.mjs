@@ -49,9 +49,20 @@ try {
   const migration = await readFile(new URL('../src/db/migrations/002_auth_rbac_rls.sql', import.meta.url), 'utf8');
   const migration006 = await readFile(new URL('../src/db/migrations/006_inbound_data_preflight.sql', import.meta.url), 'utf8');
   const migration007 = await readFile(new URL('../src/db/migrations/007_connection_scoped_customer_identity.sql', import.meta.url), 'utf8');
+  const migration008 = await readFile(new URL('../src/db/migrations/008_active_conversation_integrity.sql', import.meta.url), 'utf8');
   await db.query(schema);
   await db.query(migration);
   await db.query(migration); // idempotency
+  const getConversationMetadata = async () => (await db.query(`
+    SELECT 'constraint' kind,conname name,pg_get_constraintdef(oid) definition FROM pg_constraint
+      WHERE conname IN('channel_connections_id_workspace_channel_unique','customers_id_workspace_connection_unique','conversations_connection_channel_tenant_fk','conversations_customer_connection_fk')
+    UNION ALL SELECT 'index',indexname,indexdef FROM pg_indexes WHERE indexname='conversations_one_active_connection_customer'
+    UNION ALL SELECT 'function',proname,array_to_string(proconfig,',') FROM pg_proc WHERE oid='public.resolve_active_conversation(uuid,uuid)'::regprocedure
+    ORDER BY kind,name
+  `)).rows;
+  const freshConversationMetadata=await getConversationMetadata();
+  if(freshConversationMetadata.length!==6||!freshConversationMetadata.find(row=>row.kind==='function')?.definition?.includes('search_path=pg_catalog, public')) throw new Error(`fresh issue 58 schema incomplete: ${JSON.stringify(freshConversationMetadata)}`);
+  await db.query(`DROP FUNCTION public.resolve_active_conversation(UUID,UUID); DROP INDEX public.conversations_one_active_connection_customer; ALTER TABLE public.conversations DROP CONSTRAINT conversations_customer_connection_fk,DROP CONSTRAINT conversations_connection_channel_tenant_fk; ALTER TABLE public.customers DROP CONSTRAINT customers_id_workspace_connection_unique; ALTER TABLE public.channel_connections DROP CONSTRAINT channel_connections_id_workspace_channel_unique;`);
   const getIdentityMetadata = async () => (await db.query(`
     SELECT 'constraint' AS kind, conname AS name, pg_get_constraintdef(oid) AS definition
     FROM pg_constraint WHERE conrelid IN ('public.customers'::regclass,'public.channel_connections'::regclass)
@@ -230,6 +241,40 @@ try {
     }
     await direct.query('ROLLBACK');
   } finally { direct.release(); }
+
+  const duplicateConversations=[randomUUID(),randomUUID()];
+  await db.query("INSERT INTO conversations(id,workspace_id,connection_id,customer_id,channel,status) VALUES($1,$2,$3,$4,'telegram','new'),($5,$2,$3,$4,'telegram','human_handling')",[duplicateConversations[0],ids.w1,identityConnections.first,concurrentCustomers[0].id,duplicateConversations[1]]);
+  let duplicatePreflight=false;
+  try { await db.query(migration008); } catch(error) { duplicatePreflight=error?.code==='P0001'&&error.message.includes('duplicate active groups=1'); await db.query('COMMIT'); }
+  if(!duplicatePreflight) throw new Error('migration 008 did not stop on duplicate active legacy groups');
+  await db.query('DELETE FROM conversations WHERE id=ANY($1::uuid[])',[duplicateConversations]);
+  await db.query(migration008); await db.query(migration008);
+  const migratedConversationMetadata=await getConversationMetadata();
+  if(JSON.stringify(migratedConversationMetadata)!==JSON.stringify(freshConversationMetadata)) throw new Error(`issue 58 fresh/migrated schema mismatch: ${JSON.stringify(migratedConversationMetadata)}`);
+
+  const runtimeResolve=async(userId,connectionId,customerId)=>{const client=await pool.connect();try{await client.query('BEGIN');await client.query(`SET LOCAL ROLE ${qi(runtimeRole)}`);await client.query("SELECT set_config('app.user_id',$1,true)",[userId]);const result=await client.query('SELECT id,workspace_id,connection_id,customer_id,channel,status FROM resolve_active_conversation($1,$2)',[connectionId,customerId]);await client.query('COMMIT');return result.rows[0];}catch(error){await client.query('ROLLBACK');throw error;}finally{client.release();}};
+  const raced=await Promise.all(Array.from({length:8},()=>runtimeResolve(ids.u1,identityConnections.first,concurrentCustomers[0].id)));
+  if(new Set(raced.map(row=>row.id)).size!==1) throw new Error('concurrent resolver created multiple active conversations');
+  await expectCount(db,`SELECT count(*) FROM conversations WHERE connection_id='${identityConnections.first}' AND customer_id='${concurrentCustomers[0].id}' AND status IN('new','ai_handling','waiting_for_customer','human_attention_required','human_handling','qualified_lead')`,1,'active conversation race');
+  const otherConnectionConversation=await runtimeResolve(ids.u1,identityConnections.second,isolatedCustomer.id);
+  if(otherConnectionConversation.id===raced[0].id) throw new Error('conversation identity leaked across connections');
+
+  await db.query('DELETE FROM conversations WHERE id=ANY($1::uuid[])',[[raced[0].id,otherConnectionConversation.id]]);
+  for(const status of ['new','ai_handling','waiting_for_customer','human_attention_required','human_handling','qualified_lead']){
+    const first=randomUUID();await db.query('INSERT INTO conversations(id,workspace_id,connection_id,customer_id,channel,status) VALUES($1,$2,$3,$4,$5,$6)',[first,ids.w1,identityConnections.first,concurrentCustomers[0].id,'telegram',status]);let unique=false;try{await db.query('INSERT INTO conversations(workspace_id,connection_id,customer_id,channel,status) VALUES($1,$2,$3,$4,$5)',[ids.w1,identityConnections.first,concurrentCustomers[0].id,'telegram','new']);}catch(error){unique=error?.code==='23505';}if(!unique)throw new Error(`active status ${status} allowed a duplicate`);await db.query('DELETE FROM conversations WHERE id=$1',[first]);
+  }
+  for(const status of ['resolved','closed','spam']){await db.query('INSERT INTO conversations(workspace_id,connection_id,customer_id,channel,status) VALUES($1,$2,$3,$4,$5)',[ids.w1,identityConnections.first,concurrentCustomers[0].id,'telegram',status]);const active=await runtimeResolve(ids.u1,identityConnections.first,concurrentCustomers[0].id);if(active.status!=='new')throw new Error(`inactive status ${status} prevented a new active conversation`);await db.query('DELETE FROM conversations WHERE connection_id=$1 AND customer_id=$2',[identityConnections.first,concurrentCustomers[0].id]);}
+
+  let channelMismatch=false;
+  try{await db.query("INSERT INTO conversations(workspace_id,connection_id,customer_id,channel) VALUES($1,$2,$3,'instagram')",[ids.w1,identityConnections.first,concurrentCustomers[0].id]);}catch(error){channelMismatch=error?.code==='23503';}
+  if(!channelMismatch)throw new Error('conversation channel mismatch was not rejected');
+
+  for(const [message,operation,expectedCode] of [
+    ['tenant conversation mismatch accepted',()=>runtimeResolve(ids.u1,identityConnections.otherTenant,isolatedCustomer.id),'42501'],
+    ['customer connection mismatch accepted',()=>runtimeResolve(ids.u1,identityConnections.first,isolatedCustomer.id),'23503'],
+  ]){let code;try{await operation();}catch(error){code=error?.code;}if(code!==expectedCode)throw new Error(`${message}: expected ${expectedCode}, got ${code}`);}
+  const conversationGrant=await pool.connect();
+  try{await conversationGrant.query('BEGIN');await conversationGrant.query(`SET LOCAL ROLE ${qi(runtimeRole)}`);await conversationGrant.query("SELECT set_config('app.user_id',$1,true)",[ids.u1]);const allowed=await runtimeResolve(ids.u1,identityConnections.first,concurrentCustomers[0].id);for(const statement of [["INSERT INTO conversations(workspace_id,connection_id,customer_id,channel) VALUES($1,$2,$3,'telegram')",[ids.w1,identityConnections.first,concurrentCustomers[0].id]],["UPDATE conversations SET customer_id=$1 WHERE id=$2",[isolatedCustomer.id,allowed.id]],["DELETE FROM conversations WHERE id=$1",[allowed.id]]]){await conversationGrant.query('SAVEPOINT denied_conversation');let denied=false;try{await conversationGrant.query(statement[0],statement[1]);}catch(error){denied=error?.code==='42501';await conversationGrant.query('ROLLBACK TO SAVEPOINT denied_conversation');}await conversationGrant.query('RELEASE SAVEPOINT denied_conversation');if(!denied)throw new Error('runtime conversation identity mutation was not denied');}await conversationGrant.query("UPDATE conversations SET status='ai_handling',summary='allowed' WHERE id=$1",[allowed.id]);await conversationGrant.query('ROLLBACK');}finally{conversationGrant.release();}
   tx = await pool.connect();
   await tx.query(`SET ROLE ${qi(login)}`);
   await tx.query('BEGIN'); await tx.query(`SET LOCAL ROLE ${qi(runtimeRole)}`); await tx.query("SELECT set_config('app.user_id',$1,true)",[ids.u1]);
