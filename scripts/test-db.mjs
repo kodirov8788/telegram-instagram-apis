@@ -48,12 +48,16 @@ try {
   const schema = await readFile(new URL('../src/db/schema.sql', import.meta.url), 'utf8');
   const migration = await readFile(new URL('../src/db/migrations/002_auth_rbac_rls.sql', import.meta.url), 'utf8');
   const migration003 = await readFile(new URL('../src/db/migrations/003_webhook_connection_resolution.sql', import.meta.url), 'utf8');
+  const migration004 = await readFile(new URL('../src/db/migrations/004_provider_events.sql', import.meta.url), 'utf8');
   await db.query(schema);
   await db.query(migration);
   await db.query(migration); // idempotency
   await db.query(migration003);
   await db.query(migration003); // idempotency
+  await db.query(migration004);
+  await db.query(migration004); // idempotency
   await db.query('RESET ROLE');
+
 
   const attrs = (await db.query('SELECT rolcanlogin,rolinherit,rolsuper,rolbypassrls,rolcreatedb,rolcreaterole,rolreplication FROM pg_roles WHERE rolname=$1', [runtimeRole])).rows[0];
   if (!attrs || attrs.rolcanlogin || attrs.rolinherit || attrs.rolsuper || attrs.rolbypassrls || attrs.rolcreatedb || attrs.rolcreaterole || attrs.rolreplication) throw new Error('runtime role retained dangerous attributes');
@@ -82,6 +86,63 @@ try {
   const replay = await db.query('SELECT * FROM accept_workspace_invitation($1)', [invitationHash]);
   if (replay.rowCount !== 0) throw new Error('accepted invitation replay was not rejected');
   await db.query('ROLLBACK'); await db.query('RESET ROLE');
+
+  const connectionResult = await db.query("SELECT id FROM channel_connections WHERE webhook_identifier = $1", [ids.telegramWebhook]);
+  const connId = connectionResult.rows[0]?.id;
+  if (!connId) throw new Error('telegram webhook channel connection not found');
+
+  // Composite FK check
+  let mismatchedFkDenied = false;
+  try {
+    await db.query(
+      "INSERT INTO provider_events(workspace_id, connection_id, provider, provider_event_id, payload, payload_hash, status) VALUES($1, $2, 'telegram', 'event-fk-test', '{}', 'hash', 'received')",
+      [ids.w2, connId]
+    );
+  } catch (error) {
+    mismatchedFkDenied = error?.code === '23503';
+  }
+  if (!mismatchedFkDenied) throw new Error('composite FK mismatch on provider_events was not denied');
+
+  // Provider must match the referenced connection channel.
+  let mismatchedProviderDenied = false;
+  try {
+    await db.query(
+      "INSERT INTO provider_events(workspace_id, connection_id, provider, provider_event_id, payload, payload_hash, status) VALUES($1, $2, 'instagram', 'event-provider-test', '{}', 'hash', 'received')",
+      [ids.w1, connId]
+    );
+  } catch (error) {
+    mismatchedProviderDenied = error?.code === '23503';
+  }
+  if (!mismatchedProviderDenied) throw new Error('provider/connection channel mismatch was not denied');
+
+  // Status check constraint
+  let invalidStatusDenied = false;
+  try {
+    await db.query(
+      "INSERT INTO provider_events(workspace_id, connection_id, provider, provider_event_id, payload, payload_hash, status) VALUES($1, $2, 'telegram', 'event-status-test', '{}', 'hash', 'invalid_status')",
+      [ids.w1, connId]
+    );
+  } catch (error) {
+    invalidStatusDenied = error?.code === '23514';
+  }
+  if (!invalidStatusDenied) throw new Error('invalid status constraint on provider_events was not enforced');
+
+  // Uniqueness check
+  await db.query(
+    "INSERT INTO provider_events(workspace_id, connection_id, provider, provider_event_id, payload, payload_hash, status) VALUES($1, $2, 'telegram', 'dup-event-id', '{}', 'hash', 'received')",
+    [ids.w1, connId]
+  );
+  let dupDenied = false;
+  try {
+    await db.query(
+      "INSERT INTO provider_events(workspace_id, connection_id, provider, provider_event_id, payload, payload_hash, status) VALUES($1, $2, 'telegram', 'dup-event-id', '{}', 'hash', 'received')",
+      [ids.w1, connId]
+    );
+  } catch (error) {
+    dupDenied = error?.code === '23505';
+  }
+  if (!dupDenied) throw new Error('duplicate (connection_id, provider_event_id) unique constraint was not enforced');
+
   await db.query("INSERT INTO customers(id,workspace_id,full_name) VALUES($1,$2,'One'),($3,$4,'Two')", [ids.c1,ids.w1,ids.c2,ids.w2]);
   await db.query("INSERT INTO conversations(id,workspace_id,customer_id,channel) VALUES($1,$2,$3,'telegram'),($4,$5,$6,'telegram')", [ids.v1,ids.w1,ids.c1,ids.v2,ids.w2,ids.c2]);
   await db.query("INSERT INTO messages(conversation_id,sender,content) VALUES($1,'customer','one'),($2,'customer','two')", [ids.v1,ids.v2]);
@@ -99,6 +160,32 @@ try {
   await reused.query('BEGIN'); await reused.query(`SET LOCAL ROLE ${qi(runtimeRole)}`);
   await reused.query("SELECT set_config('app.webhook_identifier',$1,true),set_config('app.webhook_provider','telegram',true)",[ids.telegramWebhook]);
   await expectCount(reused,'SELECT count(*) FROM channel_connections',1,'matching webhook connection visibility');
+
+  // Can insert provider event for this connection
+  await reused.query(
+    "INSERT INTO provider_events(workspace_id, connection_id, provider, provider_event_id, payload, payload_hash, status) VALUES($1, $2, 'telegram', 'rls-test-1', '{}', 'hash', 'received')",
+    [ids.w1, connId]
+  );
+  await expectCount(reused, "SELECT count(*) FROM provider_events WHERE provider_event_id = 'rls-test-1'", 1, 'matching webhook provider event visibility');
+
+  // Change webhook identifier GUC to something else (e.g. inactiveWebhook or random)
+  await reused.query("SELECT set_config('app.webhook_identifier',$1,true)", [ids.inactiveWebhook]);
+  await expectCount(reused, "SELECT count(*) FROM provider_events WHERE provider_event_id = 'rls-test-1'", 0, 'wrong webhook GUC provider event isolation');
+
+  // Try inserting with GUC pointing to a connection identifier we don't have access to
+  let rlsInsertDenied = false;
+  try {
+    await reused.query(
+      "INSERT INTO provider_events(workspace_id, connection_id, provider, provider_event_id, payload, payload_hash, status) VALUES($1, $2, 'telegram', 'rls-test-2', '{}', 'hash', 'received')",
+      [ids.w1, connId]
+    );
+  } catch (error) {
+    rlsInsertDenied = error?.code === '42501'; // insufficient privilege (RLS WITH CHECK constraint violation)
+  }
+  if (!rlsInsertDenied) throw new Error('cross-tenant/wrong GUC provider event insert was not denied by RLS');
+
+  // Restore matching GUC and cleanup
+  await reused.query("SELECT set_config('app.webhook_identifier',$1,true)", [ids.telegramWebhook]);
   await reused.query("SELECT set_config('app.webhook_provider','instagram',true)");
   await expectCount(reused,'SELECT count(*) FROM channel_connections',0,'wrong-provider webhook visibility');
   await reused.query("SELECT set_config('app.webhook_identifier',$1,true),set_config('app.webhook_provider','instagram',true)",[ids.inactiveWebhook]);
