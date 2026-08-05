@@ -89,10 +89,14 @@ CREATE TABLE IF NOT EXISTS provider_events (
     status VARCHAR(50) NOT NULL DEFAULT 'received',
     attempts INTEGER NOT NULL DEFAULT 0,
     processed_at TIMESTAMP WITH TIME ZONE,
+    completed_at TIMESTAMP WITH TIME ZONE,
+    result_message_id UUID,
+    result_conversation_id UUID,
     last_error TEXT,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     CONSTRAINT provider_events_status_check CHECK (status IN ('received', 'queued', 'processing', 'processed', 'retryable_failed', 'permanent_failed')),
+    CONSTRAINT provider_events_completion_check CHECK (status <> 'processed' OR completed_at IS NOT NULL),
     CONSTRAINT provider_events_connection_tenant_fk FOREIGN KEY (connection_id, workspace_id, provider) REFERENCES channel_connections(id, workspace_id, channel) ON DELETE CASCADE,
     CONSTRAINT provider_events_connection_event_unique UNIQUE (connection_id, provider_event_id)
 );
@@ -102,6 +106,8 @@ CREATE TABLE IF NOT EXISTS provider_events (
 CREATE TABLE IF NOT EXISTS customers (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    connection_id UUID NOT NULL,
+    provider_user_id TEXT NOT NULL,
     full_name VARCHAR(255),
     telegram_username VARCHAR(255),
     telegram_id VARCHAR(255),
@@ -113,7 +119,10 @@ CREATE TABLE IF NOT EXISTS customers (
     tags TEXT[] DEFAULT '{}',
     consent_status BOOLEAN DEFAULT TRUE,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    last_contact_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    last_contact_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    CONSTRAINT customers_connection_tenant_fk FOREIGN KEY(connection_id,workspace_id) REFERENCES channel_connections(id,workspace_id) ON DELETE RESTRICT,
+    CONSTRAINT customers_provider_identity_pair_check CHECK ((connection_id IS NULL) = (provider_user_id IS NULL)),
+    CONSTRAINT customers_connection_provider_user_unique UNIQUE(connection_id,provider_user_id)
 );
 
 -- 6. Conversations
@@ -123,6 +132,7 @@ DO $$ BEGIN CREATE TYPE conversation_status AS ENUM ('new', 'ai_handling', 'wait
 CREATE TABLE IF NOT EXISTS conversations (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    connection_id UUID NOT NULL,
     customer_id UUID NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
     channel channel_type NOT NULL,
     status conversation_status DEFAULT 'new',
@@ -135,7 +145,8 @@ CREATE TABLE IF NOT EXISTS conversations (
     unread_count INT DEFAULT 0,
     summary TEXT,
     last_message_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    CONSTRAINT conversations_connection_tenant_fk FOREIGN KEY(connection_id,workspace_id,channel) REFERENCES channel_connections(id,workspace_id,channel) ON DELETE RESTRICT
 );
 
 -- 7. Messages
@@ -144,6 +155,10 @@ DO $$ BEGIN CREATE TYPE sender_type AS ENUM ('customer', 'ai', 'human_operator',
 CREATE TABLE IF NOT EXISTS messages (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    provider_event_id UUID,
+    parent_message_id UUID,
+    provider_message_id TEXT,
     sender sender_type NOT NULL,
     sender_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
     content TEXT NOT NULL,
@@ -153,6 +168,28 @@ CREATE TABLE IF NOT EXISTS messages (
     ai_confidence FLOAT,
     knowledge_sources_used JSONB,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS outbound_jobs (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    connection_id UUID NOT NULL,
+    conversation_id UUID NOT NULL,
+    message_id UUID NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','queued','processing','retryable_failed','sent','permanent_failed','cancelled')),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+    next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    locked_at TIMESTAMPTZ,
+    locked_by TEXT,
+    provider_message_id TEXT,
+    last_error TEXT,
+    sent_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT outbound_jobs_connection_tenant_fk FOREIGN KEY(connection_id,workspace_id) REFERENCES channel_connections(id,workspace_id) ON DELETE RESTRICT,
+    CONSTRAINT outbound_jobs_workspace_idempotency_unique UNIQUE(workspace_id,idempotency_key),
+    CONSTRAINT outbound_jobs_message_unique UNIQUE(message_id)
 );
 
 -- 8. Leads
@@ -228,6 +265,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS workspace_invitations_one_live_email ON worksp
 CREATE UNIQUE INDEX IF NOT EXISTS channel_connections_webhook_identifier_unique ON channel_connections(webhook_identifier);
 CREATE INDEX IF NOT EXISTS idx_provider_events_status ON provider_events(status);
 CREATE INDEX IF NOT EXISTS idx_provider_events_workspace_id ON provider_events(workspace_id);
+CREATE INDEX IF NOT EXISTS idx_provider_events_recovery ON provider_events(status,updated_at) WHERE status IN ('received','queued','processing','retryable_failed');
+CREATE UNIQUE INDEX IF NOT EXISTS conversations_one_open_per_connection_customer ON conversations(connection_id,customer_id) WHERE status NOT IN ('resolved','closed','spam');
+CREATE UNIQUE INDEX IF NOT EXISTS messages_provider_message_unique ON messages(workspace_id,provider_message_id) WHERE provider_message_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_messages_provider_event ON messages(provider_event_id) WHERE provider_event_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_messages_parent ON messages(parent_message_id) WHERE parent_message_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_outbound_jobs_claim ON outbound_jobs(next_attempt_at,created_at) WHERE status IN ('pending','queued','retryable_failed');
+CREATE INDEX IF NOT EXISTS idx_outbound_jobs_conversation ON outbound_jobs(conversation_id,created_at DESC);
 
 -- Supabase/PostgREST defense in depth. Direct clients cannot select another tenant.
 CREATE OR REPLACE FUNCTION current_user_is_workspace_member(target UUID)
@@ -248,6 +292,7 @@ ALTER TABLE leads ENABLE ROW LEVEL SECURITY;
 ALTER TABLE knowledge_items ENABLE ROW LEVEL SECURITY;
 ALTER TABLE follow_up_rules ENABLE ROW LEVEL SECURITY;
 ALTER TABLE audit_logs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE outbound_jobs ENABLE ROW LEVEL SECURITY;
 
 -- Policy target roles must exist before CREATE POLICY references them.
 DO $$ BEGIN IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='ydeck_tenant_runtime_v2') THEN CREATE ROLE ydeck_tenant_runtime_v2 NOLOGIN NOINHERIT NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION; END IF; END $$;
@@ -257,29 +302,84 @@ DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' A
 DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='workspace_invitations' AND policyname='invitation_tenant_policy') THEN CREATE POLICY invitation_tenant_policy ON workspace_invitations USING (current_user_is_workspace_member(workspace_id)) WITH CHECK (current_user_is_workspace_member(workspace_id)); END IF; END $$;
 DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='channel_connections' AND policyname='channel_tenant_policy') THEN CREATE POLICY channel_tenant_policy ON channel_connections USING (current_user_is_workspace_member(workspace_id)) WITH CHECK (current_user_is_workspace_member(workspace_id)); END IF; END $$;
 DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='provider_events' AND policyname='provider_event_tenant_policy') THEN CREATE POLICY provider_event_tenant_policy ON provider_events USING (current_user_is_workspace_member(workspace_id)) WITH CHECK (current_user_is_workspace_member(workspace_id)); END IF; END $$;
-DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='provider_events' AND policyname='provider_event_webhook_policy') THEN CREATE POLICY provider_event_webhook_policy ON provider_events TO ydeck_tenant_runtime_v2 USING (provider::TEXT = NULLIF(current_setting('app.webhook_provider', true), '') AND connection_id IN (SELECT id FROM public.channel_connections WHERE is_active IS TRUE AND webhook_identifier = NULLIF(current_setting('app.webhook_identifier', true), '')::UUID AND channel::TEXT = NULLIF(current_setting('app.webhook_provider', true), ''))) WITH CHECK (provider::TEXT = NULLIF(current_setting('app.webhook_provider', true), '') AND connection_id IN (SELECT id FROM public.channel_connections WHERE is_active IS TRUE AND webhook_identifier = NULLIF(current_setting('app.webhook_identifier', true), '')::UUID AND channel::TEXT = NULLIF(current_setting('app.webhook_provider', true), ''))); END IF; END $$;
+DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='provider_events' AND policyname='provider_event_webhook_policy') THEN CREATE POLICY provider_event_webhook_policy ON provider_events FOR INSERT TO ydeck_tenant_runtime_v2 WITH CHECK (provider::TEXT = NULLIF(current_setting('app.webhook_provider', true), '') AND connection_id IN (SELECT id FROM public.channel_connections WHERE is_active IS TRUE AND webhook_identifier = NULLIF(current_setting('app.webhook_identifier', true), '')::UUID AND channel::TEXT = NULLIF(current_setting('app.webhook_provider', true), ''))); END IF; END $$;
 DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='customers' AND policyname='customer_tenant_policy') THEN CREATE POLICY customer_tenant_policy ON customers USING (current_user_is_workspace_member(workspace_id)) WITH CHECK (current_user_is_workspace_member(workspace_id)); END IF; END $$;
 DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='conversations' AND policyname='conversation_tenant_policy') THEN CREATE POLICY conversation_tenant_policy ON conversations USING (current_user_is_workspace_member(workspace_id)) WITH CHECK (current_user_is_workspace_member(workspace_id)); END IF; END $$;
-DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='messages' AND policyname='message_tenant_policy') THEN CREATE POLICY message_tenant_policy ON messages USING (EXISTS(SELECT 1 FROM public.conversations c WHERE c.id=conversation_id AND public.current_user_is_workspace_member(c.workspace_id))) WITH CHECK (EXISTS(SELECT 1 FROM public.conversations c WHERE c.id=conversation_id AND public.current_user_is_workspace_member(c.workspace_id))); END IF; END $$;
+DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='messages' AND policyname='message_tenant_policy') THEN CREATE POLICY message_tenant_policy ON messages USING (public.current_user_is_workspace_member(workspace_id)) WITH CHECK (public.current_user_is_workspace_member(workspace_id)); END IF; END $$;
 DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='leads' AND policyname='lead_tenant_policy') THEN CREATE POLICY lead_tenant_policy ON leads USING (current_user_is_workspace_member(workspace_id)) WITH CHECK (current_user_is_workspace_member(workspace_id)); END IF; END $$;
 DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='knowledge_items' AND policyname='knowledge_tenant_policy') THEN CREATE POLICY knowledge_tenant_policy ON knowledge_items USING (current_user_is_workspace_member(workspace_id)) WITH CHECK (current_user_is_workspace_member(workspace_id)); END IF; END $$;
 DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='follow_up_rules' AND policyname='follow_up_tenant_policy') THEN CREATE POLICY follow_up_tenant_policy ON follow_up_rules USING (current_user_is_workspace_member(workspace_id)) WITH CHECK (current_user_is_workspace_member(workspace_id)); END IF; END $$;
 DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='audit_logs' AND policyname='audit_tenant_policy') THEN CREATE POLICY audit_tenant_policy ON audit_logs USING (current_user_is_workspace_member(workspace_id)) WITH CHECK (current_user_is_workspace_member(workspace_id)); END IF; END $$;
+DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='outbound_jobs' AND policyname='outbound_job_tenant_policy') THEN CREATE POLICY outbound_job_tenant_policy ON outbound_jobs USING (current_user_is_workspace_member(workspace_id)) WITH CHECK (current_user_is_workspace_member(workspace_id)); END IF; END $$;
 
 
 -- Fresh-install equivalents of migration 002 integrity and runtime-role controls.
 DO $$ BEGIN
  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='customers_id_workspace_unique' AND conrelid='public.customers'::regclass) THEN ALTER TABLE customers ADD CONSTRAINT customers_id_workspace_unique UNIQUE(id,workspace_id); END IF;
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='conversations_id_workspace_unique' AND conrelid='public.conversations'::regclass) THEN ALTER TABLE conversations ADD CONSTRAINT conversations_id_workspace_unique UNIQUE(id,workspace_id); END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='messages_id_workspace_unique' AND conrelid='public.messages'::regclass) THEN ALTER TABLE messages ADD CONSTRAINT messages_id_workspace_unique UNIQUE(id,workspace_id); END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='provider_events_id_workspace_unique' AND conrelid='public.provider_events'::regclass) THEN ALTER TABLE provider_events ADD CONSTRAINT provider_events_id_workspace_unique UNIQUE(id,workspace_id); END IF;
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='conversations_customer_tenant_fk' AND conrelid='public.conversations'::regclass) THEN ALTER TABLE conversations ADD CONSTRAINT conversations_customer_tenant_fk FOREIGN KEY(customer_id,workspace_id) REFERENCES customers(id,workspace_id); END IF;
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='leads_customer_tenant_fk' AND conrelid='public.leads'::regclass) THEN ALTER TABLE leads ADD CONSTRAINT leads_customer_tenant_fk FOREIGN KEY(customer_id,workspace_id) REFERENCES customers(id,workspace_id); END IF;
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='leads_conversation_tenant_fk' AND conrelid='public.leads'::regclass) THEN ALTER TABLE leads ADD CONSTRAINT leads_conversation_tenant_fk FOREIGN KEY(conversation_id,workspace_id) REFERENCES conversations(id,workspace_id); END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='messages_conversation_tenant_fk' AND conrelid='public.messages'::regclass) THEN ALTER TABLE messages ADD CONSTRAINT messages_conversation_tenant_fk FOREIGN KEY(conversation_id,workspace_id) REFERENCES conversations(id,workspace_id) ON DELETE CASCADE; END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='messages_provider_event_tenant_fk' AND conrelid='public.messages'::regclass) THEN ALTER TABLE messages ADD CONSTRAINT messages_provider_event_tenant_fk FOREIGN KEY(provider_event_id,workspace_id) REFERENCES provider_events(id,workspace_id) ON DELETE RESTRICT; END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='messages_parent_tenant_fk' AND conrelid='public.messages'::regclass) THEN ALTER TABLE messages ADD CONSTRAINT messages_parent_tenant_fk FOREIGN KEY(parent_message_id,workspace_id) REFERENCES messages(id,workspace_id) ON DELETE RESTRICT; END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='provider_events_result_message_tenant_fk' AND conrelid='public.provider_events'::regclass) THEN ALTER TABLE provider_events ADD CONSTRAINT provider_events_result_message_tenant_fk FOREIGN KEY(result_message_id,workspace_id) REFERENCES messages(id,workspace_id) ON DELETE RESTRICT; END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='provider_events_result_conversation_tenant_fk' AND conrelid='public.provider_events'::regclass) THEN ALTER TABLE provider_events ADD CONSTRAINT provider_events_result_conversation_tenant_fk FOREIGN KEY(result_conversation_id,workspace_id) REFERENCES conversations(id,workspace_id) ON DELETE RESTRICT; END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='outbound_jobs_conversation_tenant_fk' AND conrelid='public.outbound_jobs'::regclass) THEN ALTER TABLE outbound_jobs ADD CONSTRAINT outbound_jobs_conversation_tenant_fk FOREIGN KEY(conversation_id,workspace_id) REFERENCES conversations(id,workspace_id) ON DELETE CASCADE; END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='outbound_jobs_message_tenant_fk' AND conrelid='public.outbound_jobs'::regclass) THEN ALTER TABLE outbound_jobs ADD CONSTRAINT outbound_jobs_message_tenant_fk FOREIGN KEY(message_id,workspace_id) REFERENCES messages(id,workspace_id) ON DELETE CASCADE; END IF;
+END $$;
+
+-- Dedicated queue-worker role. It receives queue consumption and only the data
+-- privileges required to normalize inbound events and deliver outbound jobs.
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='ydeck_queue_worker_v1') THEN
+    CREATE ROLE ydeck_queue_worker_v1 NOLOGIN NOINHERIT NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
+  END IF;
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname='ydeck_queue_worker_v1' AND (rolcanlogin OR rolinherit OR rolsuper OR rolbypassrls OR rolcreatedb OR rolcreaterole OR rolreplication)) THEN
+    RAISE EXCEPTION 'unsafe attributes on ydeck_queue_worker_v1';
+  END IF;
+END $$;
+GRANT ydeck_queue_worker_v1 TO CURRENT_USER;
+GRANT USAGE ON SCHEMA public TO ydeck_queue_worker_v1;
+GRANT EXECUTE ON FUNCTION current_user_is_workspace_member(UUID) TO ydeck_queue_worker_v1;
+GRANT SELECT,UPDATE ON provider_events TO ydeck_queue_worker_v1;
+GRANT SELECT,INSERT,UPDATE ON customers,conversations,messages,outbound_jobs TO ydeck_queue_worker_v1;
+GRANT SELECT ON channel_connections TO ydeck_queue_worker_v1;
+
+DO $$ DECLARE item record; BEGIN
+  FOR item IN SELECT * FROM (VALUES
+    ('provider_events','provider_event_worker_policy'),('customers','customer_worker_policy'),
+    ('conversations','conversation_worker_policy'),('messages','message_worker_policy'),
+    ('outbound_jobs','outbound_job_worker_policy')) v(tablename,policyname)
+  LOOP
+    IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename=item.tablename AND policyname=item.policyname) THEN
+      EXECUTE format('CREATE POLICY %I ON %I TO ydeck_queue_worker_v1 USING (workspace_id=NULLIF(current_setting(''app.workspace_id'',true),'''')::uuid) WITH CHECK (workspace_id=NULLIF(current_setting(''app.workspace_id'',true),'''')::uuid)',item.policyname,item.tablename);
+    END IF;
+  END LOOP;
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='channel_connections' AND policyname='channel_worker_policy') THEN
+    CREATE POLICY channel_worker_policy ON channel_connections TO ydeck_queue_worker_v1 USING (workspace_id=NULLIF(current_setting('app.workspace_id',true),'')::uuid);
+  END IF;
+END $$;
+
+DO $$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_extension WHERE extname='pgmq') THEN
+    EXECUTE 'REVOKE EXECUTE ON FUNCTION ydeck_queue.read(text,integer,integer,jsonb) FROM ydeck_tenant_runtime_v2';
+    EXECUTE 'REVOKE EXECUTE ON FUNCTION ydeck_queue.delete(text,bigint) FROM ydeck_tenant_runtime_v2';
+    EXECUTE 'REVOKE EXECUTE ON FUNCTION ydeck_queue.archive(text,bigint) FROM ydeck_tenant_runtime_v2';
+    EXECUTE 'GRANT USAGE ON SCHEMA ydeck_queue TO ydeck_queue_worker_v1';
+    EXECUTE 'GRANT EXECUTE ON FUNCTION ydeck_queue.send(text,jsonb,integer) TO ydeck_queue_worker_v1';
+    EXECUTE 'GRANT EXECUTE ON FUNCTION ydeck_queue.read(text,integer,integer,jsonb) TO ydeck_queue_worker_v1';
+    EXECUTE 'GRANT EXECUTE ON FUNCTION ydeck_queue.delete(text,bigint) TO ydeck_queue_worker_v1';
+    EXECUTE 'GRANT EXECUTE ON FUNCTION ydeck_queue.archive(text,bigint) TO ydeck_queue_worker_v1';
+  END IF;
 END $$;
 DO $$ BEGIN IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname='ydeck_tenant_runtime_v2' AND (rolcanlogin OR rolinherit OR rolsuper OR rolbypassrls OR rolcreatedb OR rolcreaterole OR rolreplication)) THEN RAISE EXCEPTION 'unsafe attributes on ydeck_tenant_runtime_v2'; END IF; END $$;
 GRANT ydeck_tenant_runtime_v2 TO CURRENT_USER;
 REVOKE ALL ON FUNCTION current_user_is_workspace_member(UUID) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION current_user_is_workspace_member(UUID) TO ydeck_tenant_runtime_v2;
-GRANT SELECT,INSERT,UPDATE,DELETE ON workspaces,workspace_members,workspace_invitations,channel_connections,customers,conversations,messages,leads,knowledge_items,follow_up_rules,audit_logs TO ydeck_tenant_runtime_v2;
+GRANT SELECT,INSERT,UPDATE,DELETE ON workspaces,workspace_members,workspace_invitations,channel_connections,customers,conversations,messages,leads,knowledge_items,follow_up_rules,audit_logs,outbound_jobs TO ydeck_tenant_runtime_v2;
 GRANT SELECT,INSERT ON provider_events TO ydeck_tenant_runtime_v2;
 DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' AND tablename='channel_connections' AND policyname='channel_webhook_resolution_policy') THEN CREATE POLICY channel_webhook_resolution_policy ON channel_connections FOR SELECT TO ydeck_tenant_runtime_v2 USING (is_active IS TRUE AND webhook_identifier = NULLIF(current_setting('app.webhook_identifier', true), '')::UUID AND channel::TEXT = NULLIF(current_setting('app.webhook_provider', true), '')); END IF; END $$;
 CREATE OR REPLACE FUNCTION bootstrap_workspace(p_name TEXT, p_industry TEXT, p_time_zone TEXT, p_default_language TEXT, p_working_hours JSONB)
@@ -300,8 +400,7 @@ BEGIN
  IF actor IS NULL THEN RAISE EXCEPTION 'authenticated identity required' USING ERRCODE='28000'; END IF;
  SELECT i.id,i.workspace_id,i.role INTO invite_id,invite_workspace,invite_role FROM public.workspace_invitations i JOIN public.users u ON u.id=actor AND lower(u.email)=lower(i.email) WHERE i.token_hash=p_token_hash AND i.accepted_at IS NULL AND i.expires_at>NOW() FOR UPDATE OF i;
  IF NOT FOUND THEN RETURN; END IF;
- INSERT INTO public.workspace_members(workspace_id,user_id,role) VALUES(invite_workspace,actor,invite_role) ON CONFLICT ON CONSTRAINT workspace_members_pkey DO NOTHING RETURNING user_id INTO inserted;
- IF inserted IS NULL THEN RETURN; END IF;
+ INSERT INTO public.workspace_members(workspace_id,user_id,role) VALUES(invite_workspace,actor,invite_role) ON CONFLICT(workspace_id,user_id) DO UPDATE SET role=EXCLUDED.role RETURNING user_id INTO inserted;
  UPDATE public.workspace_invitations SET accepted_at=NOW() WHERE id=invite_id;
  workspace_id:=invite_workspace; role:=invite_role; RETURN NEXT;
 END $fn$;
@@ -309,7 +408,7 @@ REVOKE ALL ON FUNCTION bootstrap_workspace(TEXT,TEXT,TEXT,TEXT,JSONB) FROM PUBLI
 REVOKE ALL ON FUNCTION accept_workspace_invitation(TEXT) FROM PUBLIC;
 -- Bootstrap SECURITY DEFINER functions and the membership predicate must owner-bypass
 -- these three tables; the non-owner runtime role remains subject to their enabled RLS.
-DO $$ DECLARE t text; BEGIN FOREACH t IN ARRAY ARRAY['channel_connections','provider_events','customers','conversations','messages','leads','knowledge_items','follow_up_rules','audit_logs'] LOOP EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY',t); END LOOP; END $$;
+DO $$ DECLARE t text; BEGIN FOREACH t IN ARRAY ARRAY['channel_connections','provider_events','customers','conversations','messages','leads','knowledge_items','follow_up_rules','audit_logs','outbound_jobs'] LOOP EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY',t); END LOOP; END $$;
 
 -- Conditionally enable pgmq if available, to maintain stock test:db parity
 DO $$
@@ -420,9 +519,14 @@ BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ydeck_tenant_runtime_v2') THEN
       EXECUTE 'GRANT USAGE ON SCHEMA ydeck_queue TO ydeck_tenant_runtime_v2';
       EXECUTE 'GRANT EXECUTE ON FUNCTION ydeck_queue.send(text, jsonb, integer) TO ydeck_tenant_runtime_v2';
-      EXECUTE 'GRANT EXECUTE ON FUNCTION ydeck_queue.read(text, integer, integer, jsonb) TO ydeck_tenant_runtime_v2';
-      EXECUTE 'GRANT EXECUTE ON FUNCTION ydeck_queue.delete(text, bigint) TO ydeck_tenant_runtime_v2';
-      EXECUTE 'GRANT EXECUTE ON FUNCTION ydeck_queue.archive(text, bigint) TO ydeck_tenant_runtime_v2';
+      EXECUTE 'REVOKE EXECUTE ON FUNCTION ydeck_queue.read(text, integer, integer, jsonb) FROM ydeck_tenant_runtime_v2';
+      EXECUTE 'REVOKE EXECUTE ON FUNCTION ydeck_queue.delete(text, bigint) FROM ydeck_tenant_runtime_v2';
+      EXECUTE 'REVOKE EXECUTE ON FUNCTION ydeck_queue.archive(text, bigint) FROM ydeck_tenant_runtime_v2';
+      EXECUTE 'GRANT USAGE ON SCHEMA ydeck_queue TO ydeck_queue_worker_v1';
+      EXECUTE 'GRANT EXECUTE ON FUNCTION ydeck_queue.send(text, jsonb, integer) TO ydeck_queue_worker_v1';
+      EXECUTE 'GRANT EXECUTE ON FUNCTION ydeck_queue.read(text, integer, integer, jsonb) TO ydeck_queue_worker_v1';
+      EXECUTE 'GRANT EXECUTE ON FUNCTION ydeck_queue.delete(text, bigint) TO ydeck_queue_worker_v1';
+      EXECUTE 'GRANT EXECUTE ON FUNCTION ydeck_queue.archive(text, bigint) TO ydeck_queue_worker_v1';
     END IF;
   ELSE
     RAISE NOTICE 'pgmq extension not available, skipping queue schema initialization';
