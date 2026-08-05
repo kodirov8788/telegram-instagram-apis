@@ -310,3 +310,121 @@ REVOKE ALL ON FUNCTION accept_workspace_invitation(TEXT) FROM PUBLIC;
 -- Bootstrap SECURITY DEFINER functions and the membership predicate must owner-bypass
 -- these three tables; the non-owner runtime role remains subject to their enabled RLS.
 DO $$ DECLARE t text; BEGIN FOREACH t IN ARRAY ARRAY['channel_connections','provider_events','customers','conversations','messages','leads','knowledge_items','follow_up_rules','audit_logs'] LOOP EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY',t); END LOOP; END $$;
+
+-- Conditionally enable pgmq if available, to maintain stock test:db parity
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'pgmq') THEN
+    CREATE EXTENSION IF NOT EXISTS pgmq;
+
+    -- Use dynamic SQL to prevent compilation errors when pgmq is not yet installed
+    IF NOT EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = 'pgmq' AND tablename = 'q_inbound_events') THEN
+      EXECUTE 'SELECT pgmq.create(''inbound_events'')';
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = 'pgmq' AND tablename = 'q_outbound_messages') THEN
+      EXECUTE 'SELECT pgmq.create(''outbound_messages'')';
+    END IF;
+
+    -- Revoke from PUBLIC on pgmq
+    EXECUTE 'REVOKE ALL ON SCHEMA pgmq FROM PUBLIC';
+    EXECUTE 'REVOKE ALL ON ALL FUNCTIONS IN SCHEMA pgmq FROM PUBLIC';
+    EXECUTE 'REVOKE ALL ON ALL TABLES IN SCHEMA pgmq FROM PUBLIC';
+
+    -- Revoke from anon/authenticated on pgmq if they exist
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+      EXECUTE 'REVOKE ALL ON SCHEMA pgmq FROM anon';
+      EXECUTE 'REVOKE ALL ON ALL TABLES IN SCHEMA pgmq FROM anon';
+      EXECUTE 'REVOKE ALL ON ALL FUNCTIONS IN SCHEMA pgmq FROM anon';
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+      EXECUTE 'REVOKE ALL ON SCHEMA pgmq FROM authenticated';
+      EXECUTE 'REVOKE ALL ON ALL TABLES IN SCHEMA pgmq FROM authenticated';
+      EXECUTE 'REVOKE ALL ON ALL FUNCTIONS IN SCHEMA pgmq FROM authenticated';
+    END IF;
+
+    -- Setup ydeck_queue
+    EXECUTE 'CREATE SCHEMA IF NOT EXISTS ydeck_queue';
+
+    EXECUTE 'CREATE OR REPLACE FUNCTION ydeck_queue.send(queue_name text, msg jsonb, delay integer DEFAULT 0)
+    RETURNS bigint LANGUAGE plpgsql SECURITY DEFINER SET search_path = pgmq, pg_catalog, pg_temp AS $f$
+    BEGIN
+      IF queue_name NOT IN (''inbound_events'', ''outbound_messages'') THEN
+        RAISE EXCEPTION ''Invalid queue name: %'', queue_name;
+      END IF;
+      IF delay IS NULL OR delay < 0 THEN
+        RAISE EXCEPTION ''Delay must be an integer >= 0'';
+      END IF;
+      RETURN pgmq.send(queue_name, msg, delay);
+    END; $f$';
+
+    EXECUTE 'CREATE OR REPLACE FUNCTION ydeck_queue.read(queue_name text, visibility_timeout integer, qty integer, conditional jsonb DEFAULT ''{}''::jsonb)
+    RETURNS TABLE (msg_id bigint, read_ct integer, enqueued_at timestamp with time zone, vt timestamp with time zone, message jsonb)
+    LANGUAGE plpgsql SECURITY DEFINER SET search_path = pgmq, pg_catalog, pg_temp AS $f$
+    BEGIN
+      IF queue_name NOT IN (''inbound_events'', ''outbound_messages'') THEN
+        RAISE EXCEPTION ''Invalid queue name: %'', queue_name;
+      END IF;
+      IF visibility_timeout IS NULL OR visibility_timeout < 1 THEN
+        RAISE EXCEPTION ''Visibility timeout must be an integer >= 1'';
+      END IF;
+      IF qty IS NULL OR qty < 1 OR qty > 5 THEN
+        RAISE EXCEPTION ''Batch limit must be an integer between 1 and 5'';
+      END IF;
+      RETURN QUERY SELECT r.msg_id, r.read_ct, r.enqueued_at, r.vt, r.message FROM pgmq.read(queue_name, visibility_timeout, qty, conditional) AS r;
+    END; $f$';
+
+    EXECUTE 'CREATE OR REPLACE FUNCTION ydeck_queue.delete(queue_name text, msg_id bigint)
+    RETURNS boolean LANGUAGE plpgsql SECURITY DEFINER SET search_path = pgmq, pg_catalog, pg_temp AS $f$
+    BEGIN
+      IF queue_name NOT IN (''inbound_events'', ''outbound_messages'') THEN
+        RAISE EXCEPTION ''Invalid queue name: %'', queue_name;
+      END IF;
+      RETURN pgmq.delete(queue_name, msg_id);
+    END; $f$';
+
+    EXECUTE 'CREATE OR REPLACE FUNCTION ydeck_queue.archive(queue_name text, msg_id bigint)
+    RETURNS boolean LANGUAGE plpgsql SECURITY DEFINER SET search_path = pgmq, pg_catalog, pg_temp AS $f$
+    BEGIN
+      IF queue_name NOT IN (''inbound_events'', ''outbound_messages'') THEN
+        RAISE EXCEPTION ''Invalid queue name: %'', queue_name;
+      END IF;
+      RETURN pgmq.archive(queue_name, msg_id);
+    END; $f$';
+
+    -- Grant to CURRENT_USER (deploy role)
+    EXECUTE 'GRANT USAGE ON SCHEMA pgmq TO CURRENT_USER';
+    EXECUTE 'GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE pgmq.q_inbound_events TO CURRENT_USER';
+    EXECUTE 'GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE pgmq.q_outbound_messages TO CURRENT_USER';
+    EXECUTE 'GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE pgmq.a_inbound_events TO CURRENT_USER';
+    EXECUTE 'GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE pgmq.a_outbound_messages TO CURRENT_USER';
+    EXECUTE 'GRANT EXECUTE ON FUNCTION pgmq.send(text, jsonb, integer) TO CURRENT_USER';
+    EXECUTE 'GRANT EXECUTE ON FUNCTION pgmq.read(text, integer, integer, jsonb) TO CURRENT_USER';
+    EXECUTE 'GRANT EXECUTE ON FUNCTION pgmq.delete(text, bigint) TO CURRENT_USER';
+    EXECUTE 'GRANT EXECUTE ON FUNCTION pgmq.archive(text, bigint) TO CURRENT_USER';
+
+    -- Revoke ydeck_queue from PUBLIC/anon/authenticated
+    EXECUTE 'REVOKE ALL ON SCHEMA ydeck_queue FROM PUBLIC';
+    EXECUTE 'REVOKE ALL ON ALL FUNCTIONS IN SCHEMA ydeck_queue FROM PUBLIC';
+
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+      EXECUTE 'REVOKE ALL ON SCHEMA ydeck_queue FROM anon';
+      EXECUTE 'REVOKE ALL ON ALL FUNCTIONS IN SCHEMA ydeck_queue FROM anon';
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+      EXECUTE 'REVOKE ALL ON SCHEMA ydeck_queue FROM authenticated';
+      EXECUTE 'REVOKE ALL ON ALL FUNCTIONS IN SCHEMA ydeck_queue FROM authenticated';
+    END IF;
+
+    -- Grant to ydeck_tenant_runtime_v2
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ydeck_tenant_runtime_v2') THEN
+      EXECUTE 'GRANT USAGE ON SCHEMA ydeck_queue TO ydeck_tenant_runtime_v2';
+      EXECUTE 'GRANT EXECUTE ON FUNCTION ydeck_queue.send(text, jsonb, integer) TO ydeck_tenant_runtime_v2';
+      EXECUTE 'GRANT EXECUTE ON FUNCTION ydeck_queue.read(text, integer, integer, jsonb) TO ydeck_tenant_runtime_v2';
+      EXECUTE 'GRANT EXECUTE ON FUNCTION ydeck_queue.delete(text, bigint) TO ydeck_tenant_runtime_v2';
+      EXECUTE 'GRANT EXECUTE ON FUNCTION ydeck_queue.archive(text, bigint) TO ydeck_tenant_runtime_v2';
+    END IF;
+  ELSE
+    RAISE NOTICE 'pgmq extension not available, skipping queue schema initialization';
+  END IF;
+END $$;
