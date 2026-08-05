@@ -62,6 +62,9 @@ try {
   `)).rows;
   const freshConversationMetadata=await getConversationMetadata();
   if(freshConversationMetadata.length!==6||!freshConversationMetadata.find(row=>row.kind==='function')?.definition?.includes('search_path=pg_catalog, public')) throw new Error(`fresh issue 58 schema incomplete: ${JSON.stringify(freshConversationMetadata)}`);
+  const getResolverDefinition=async()=>(await db.query("SELECT pg_get_functiondef('public.resolve_active_conversation(uuid,uuid)'::regprocedure) definition")).rows[0].definition;
+  const freshResolverDefinition=await getResolverDefinition();
+  if(!freshResolverDefinition.includes('FOR KEY SHARE')||freshResolverDefinition.includes('current_user_is_workspace_member(derived_workspace)')) throw new Error('fresh resolver does not lock membership before authorization');
   await db.query(`DROP FUNCTION public.resolve_active_conversation(UUID,UUID); DROP INDEX public.conversations_one_active_connection_customer; ALTER TABLE public.conversations DROP CONSTRAINT conversations_customer_connection_fk,DROP CONSTRAINT conversations_connection_channel_tenant_fk; ALTER TABLE public.customers DROP CONSTRAINT customers_id_workspace_connection_unique; ALTER TABLE public.channel_connections DROP CONSTRAINT channel_connections_id_workspace_channel_unique;`);
   const getIdentityMetadata = async () => (await db.query(`
     SELECT 'constraint' AS kind, conname AS name, pg_get_constraintdef(oid) AS definition
@@ -251,6 +254,8 @@ try {
   await db.query(migration008); await db.query(migration008);
   const migratedConversationMetadata=await getConversationMetadata();
   if(JSON.stringify(migratedConversationMetadata)!==JSON.stringify(freshConversationMetadata)) throw new Error(`issue 58 fresh/migrated schema mismatch: ${JSON.stringify(migratedConversationMetadata)}`);
+  const migratedResolverDefinition=await getResolverDefinition();
+  if(!migratedResolverDefinition.includes('FOR KEY SHARE')||migratedResolverDefinition.includes('current_user_is_workspace_member(derived_workspace)')) throw new Error('migrated resolver does not lock membership before authorization');
 
   const runtimeResolve=async(userId,connectionId,customerId)=>{const client=await pool.connect();try{await client.query('BEGIN');await client.query(`SET LOCAL ROLE ${qi(runtimeRole)}`);await client.query("SELECT set_config('app.user_id',$1,true)",[userId]);const result=await client.query('SELECT id,workspace_id,connection_id,customer_id,channel,status FROM resolve_active_conversation($1,$2)',[connectionId,customerId]);await client.query('COMMIT');return result.rows[0];}catch(error){await client.query('ROLLBACK');throw error;}finally{client.release();}};
   const raced=await Promise.all(Array.from({length:8},()=>runtimeResolve(ids.u1,identityConnections.first,concurrentCustomers[0].id)));

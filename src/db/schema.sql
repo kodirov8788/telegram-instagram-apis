@@ -311,7 +311,8 @@ BEGIN
  IF p_connection_id IS NULL OR p_customer_id IS NULL THEN RAISE EXCEPTION 'connection and customer are required' USING ERRCODE='22023'; END IF;
  SELECT cc.workspace_id,cc.channel INTO derived_workspace,derived_channel FROM channel_connections cc WHERE cc.id=p_connection_id AND cc.is_active IS TRUE;
  IF derived_workspace IS NULL THEN RAISE EXCEPTION 'active provider connection not found' USING ERRCODE='23503'; END IF;
- IF NOT current_user_is_workspace_member(derived_workspace) THEN RAISE EXCEPTION 'workspace access denied' USING ERRCODE='42501'; END IF;
+ PERFORM 1 FROM workspace_members wm WHERE wm.workspace_id=derived_workspace AND wm.user_id=actor FOR KEY SHARE;
+ IF NOT FOUND THEN RAISE EXCEPTION 'workspace access denied' USING ERRCODE='42501'; END IF;
  IF NOT EXISTS(SELECT 1 FROM customers c WHERE c.id=p_customer_id AND c.workspace_id=derived_workspace AND c.connection_id=p_connection_id) THEN RAISE EXCEPTION 'connection-scoped customer not found' USING ERRCODE='23503'; END IF;
  LOOP
   INSERT INTO conversations(workspace_id,connection_id,customer_id,channel,status) VALUES(derived_workspace,p_connection_id,p_customer_id,derived_channel,'new')
