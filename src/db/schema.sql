@@ -201,6 +201,7 @@ CREATE TABLE IF NOT EXISTS audit_logs (
 -- Performance Indexes
 CREATE INDEX IF NOT EXISTS idx_conversations_workspace_status ON conversations(workspace_id, status);
 CREATE INDEX IF NOT EXISTS idx_messages_conversation_id ON messages(conversation_id);
+CREATE UNIQUE INDEX IF NOT EXISTS customers_connection_provider_identity_unique ON customers(workspace_id,connection_id,provider_user_id) WHERE connection_id IS NOT NULL AND provider_user_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_leads_workspace_status ON leads(workspace_id, status);
 CREATE INDEX IF NOT EXISTS idx_knowledge_items_workspace ON knowledge_items(workspace_id);
 CREATE INDEX IF NOT EXISTS idx_user_sessions_user ON user_sessions(user_id);
@@ -242,6 +243,8 @@ DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname='public' A
 -- Fresh-install equivalents of migration 002 integrity and runtime-role controls.
 DO $$ BEGIN
  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='customers_id_workspace_unique' AND conrelid='public.customers'::regclass) THEN ALTER TABLE customers ADD CONSTRAINT customers_id_workspace_unique UNIQUE(id,workspace_id); END IF;
+ IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='channel_connections_id_workspace_unique' AND conrelid='public.channel_connections'::regclass) THEN ALTER TABLE channel_connections ADD CONSTRAINT channel_connections_id_workspace_unique UNIQUE(id,workspace_id); END IF;
+ IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='customers_connection_tenant_fk' AND conrelid='public.customers'::regclass) THEN ALTER TABLE customers ADD CONSTRAINT customers_connection_tenant_fk FOREIGN KEY(connection_id,workspace_id) REFERENCES channel_connections(id,workspace_id); END IF;
  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='conversations_id_workspace_unique' AND conrelid='public.conversations'::regclass) THEN ALTER TABLE conversations ADD CONSTRAINT conversations_id_workspace_unique UNIQUE(id,workspace_id); END IF;
  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='conversations_customer_tenant_fk' AND conrelid='public.conversations'::regclass) THEN ALTER TABLE conversations ADD CONSTRAINT conversations_customer_tenant_fk FOREIGN KEY(customer_id,workspace_id) REFERENCES customers(id,workspace_id); END IF;
  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='leads_customer_tenant_fk' AND conrelid='public.leads'::regclass) THEN ALTER TABLE leads ADD CONSTRAINT leads_customer_tenant_fk FOREIGN KEY(customer_id,workspace_id) REFERENCES customers(id,workspace_id); END IF;
@@ -276,8 +279,29 @@ BEGIN
  UPDATE public.workspace_invitations SET accepted_at=NOW() WHERE id=invite_id;
  workspace_id:=invite_workspace; role:=invite_role; RETURN NEXT;
 END $fn$;
+CREATE OR REPLACE FUNCTION upsert_connection_customer(p_connection_id UUID,p_provider channel_type,p_provider_user_id TEXT,p_full_name TEXT DEFAULT NULL,p_username TEXT DEFAULT NULL)
+RETURNS customers LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,public AS $fn$
+DECLARE actor UUID; derived_workspace UUID; customer customers%ROWTYPE;
+BEGIN
+ actor:=NULLIF(current_setting('app.user_id',true),'')::UUID;
+ IF actor IS NULL THEN RAISE EXCEPTION 'authenticated identity required' USING ERRCODE='28000'; END IF;
+ IF p_connection_id IS NULL OR p_provider IS NULL OR NULLIF(BTRIM(p_provider_user_id),'') IS NULL THEN RAISE EXCEPTION 'connection, provider, and provider user identity are required' USING ERRCODE='22023'; END IF;
+ SELECT cc.workspace_id INTO derived_workspace FROM channel_connections cc WHERE cc.id=p_connection_id AND cc.channel=p_provider AND cc.is_active IS TRUE;
+ IF derived_workspace IS NULL THEN RAISE EXCEPTION 'active provider connection not found' USING ERRCODE='23503'; END IF;
+ IF NOT current_user_is_workspace_member(derived_workspace) THEN RAISE EXCEPTION 'workspace access denied' USING ERRCODE='42501'; END IF;
+ INSERT INTO customers(workspace_id,connection_id,provider_user_id,full_name,telegram_id,telegram_username,instagram_id,instagram_username,last_contact_at)
+ VALUES(derived_workspace,p_connection_id,BTRIM(p_provider_user_id),p_full_name,CASE WHEN p_provider='telegram' THEN BTRIM(p_provider_user_id) END,CASE WHEN p_provider='telegram' THEN p_username END,CASE WHEN p_provider='instagram' THEN BTRIM(p_provider_user_id) END,CASE WHEN p_provider='instagram' THEN p_username END,NOW())
+ ON CONFLICT(workspace_id,connection_id,provider_user_id) WHERE connection_id IS NOT NULL AND provider_user_id IS NOT NULL
+ DO UPDATE SET full_name=COALESCE(EXCLUDED.full_name,customers.full_name),telegram_username=COALESCE(EXCLUDED.telegram_username,customers.telegram_username),instagram_username=COALESCE(EXCLUDED.instagram_username,customers.instagram_username),last_contact_at=NOW()
+ RETURNING * INTO customer;
+ RETURN customer;
+END $fn$;
 REVOKE ALL ON FUNCTION bootstrap_workspace(TEXT,TEXT,TEXT,TEXT,JSONB) FROM PUBLIC;
 REVOKE ALL ON FUNCTION accept_workspace_invitation(TEXT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION upsert_connection_customer(UUID,channel_type,TEXT,TEXT,TEXT) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION upsert_connection_customer(UUID,channel_type,TEXT,TEXT,TEXT) TO ydeck_tenant_runtime_v2;
+REVOKE INSERT,UPDATE,DELETE ON customers FROM ydeck_tenant_runtime_v2;
+GRANT SELECT ON customers TO ydeck_tenant_runtime_v2;
 -- Bootstrap SECURITY DEFINER functions and the membership predicate must owner-bypass
 -- these three tables; the non-owner runtime role remains subject to their enabled RLS.
 DO $$ DECLARE t text; BEGIN FOREACH t IN ARRAY ARRAY['channel_connections','customers','conversations','messages','leads','knowledge_items','follow_up_rules','audit_logs'] LOOP EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY',t); END LOOP; END $$;

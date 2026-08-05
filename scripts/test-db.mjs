@@ -48,9 +48,30 @@ try {
   const schema = await readFile(new URL('../src/db/schema.sql', import.meta.url), 'utf8');
   const migration = await readFile(new URL('../src/db/migrations/002_auth_rbac_rls.sql', import.meta.url), 'utf8');
   const migration006 = await readFile(new URL('../src/db/migrations/006_inbound_data_preflight.sql', import.meta.url), 'utf8');
+  const migration007 = await readFile(new URL('../src/db/migrations/007_connection_scoped_customer_identity.sql', import.meta.url), 'utf8');
   await db.query(schema);
   await db.query(migration);
   await db.query(migration); // idempotency
+  const getIdentityMetadata = async () => (await db.query(`
+    SELECT 'constraint' AS kind, conname AS name, pg_get_constraintdef(oid) AS definition
+    FROM pg_constraint WHERE conrelid IN ('public.customers'::regclass,'public.channel_connections'::regclass)
+      AND conname IN ('channel_connections_id_workspace_unique','customers_connection_tenant_fk')
+    UNION ALL
+    SELECT 'index', indexname, indexdef FROM pg_indexes
+      WHERE schemaname='public' AND indexname='customers_connection_provider_identity_unique'
+    UNION ALL
+    SELECT 'function', proname, pg_get_function_identity_arguments(oid) FROM pg_proc
+      WHERE oid='public.upsert_connection_customer(uuid,public.channel_type,text,text,text)'::regprocedure
+    ORDER BY kind,name
+  `)).rows;
+  const freshIdentityMetadata = await getIdentityMetadata();
+  if (freshIdentityMetadata.length !== 4) throw new Error(`fresh issue 57 schema incomplete: ${JSON.stringify(freshIdentityMetadata)}`);
+  await db.query(`
+    DROP FUNCTION public.upsert_connection_customer(UUID, public.channel_type, TEXT, TEXT, TEXT);
+    DROP INDEX public.customers_connection_provider_identity_unique;
+    ALTER TABLE public.customers DROP CONSTRAINT customers_connection_tenant_fk;
+    ALTER TABLE public.channel_connections DROP CONSTRAINT channel_connections_id_workspace_unique;
+  `);
   await db.query(`
     ALTER TABLE public.customers DROP COLUMN connection_id, DROP COLUMN provider_user_id;
     ALTER TABLE public.conversations DROP COLUMN connection_id;
@@ -154,7 +175,61 @@ try {
     throw new Error(`migration 006 safe backfill failed: ${JSON.stringify(result)}`);
   }
 
-  pool = new Pool({ connectionString: testUrl.toString(), max: 1 });
+  await db.query('DELETE FROM customers WHERE id=$1', [preflight.conflictingCustomer]);
+  await db.query(migration007);
+  await db.query(migration007); // migration rerun
+  const migratedIdentityMetadata = await getIdentityMetadata();
+  if (JSON.stringify(migratedIdentityMetadata) !== JSON.stringify(freshIdentityMetadata)) {
+    throw new Error(`issue 57 fresh/migrated schema mismatch: fresh=${JSON.stringify(freshIdentityMetadata)} migrated=${JSON.stringify(migratedIdentityMetadata)}`);
+  }
+
+  const identityConnections = { first: randomUUID(), second: randomUUID(), otherTenant: randomUUID() };
+  await db.query("INSERT INTO channel_connections(id,workspace_id,channel,account_identifier,credentials,is_active) VALUES($1,$2,'telegram','identity-1','{}',true),($3,$2,'telegram','identity-2','{}',true),($4,$5,'telegram','identity-other','{}',true)", [identityConnections.first, ids.w1, identityConnections.second, identityConnections.otherTenant, ids.w2]);
+
+  pool = new Pool({ connectionString: testUrl.toString(), max: 8 });
+  const runtimeUpsert = async (userId, connectionId, provider, providerUserId) => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(`SET LOCAL ROLE ${qi(runtimeRole)}`);
+      await client.query("SELECT set_config('app.user_id',$1,true)", [userId]);
+      const result = await client.query('SELECT id,workspace_id,connection_id,provider_user_id FROM upsert_connection_customer($1,$2,$3,$4,$5)', [connectionId, provider, providerUserId, 'Concurrent customer', 'concurrent']);
+      await client.query('COMMIT');
+      return result.rows[0];
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally { client.release(); }
+  };
+  const concurrentCustomers = await Promise.all(Array.from({ length: 8 }, () => runtimeUpsert(ids.u1, identityConnections.first, 'telegram', 'same-user')));
+  if (new Set(concurrentCustomers.map(customer => customer.id)).size !== 1) throw new Error('concurrent identity upsert returned multiple customers');
+  await expectCount(db, `SELECT count(*) FROM customers WHERE workspace_id='${ids.w1}' AND connection_id='${identityConnections.first}' AND provider_user_id='same-user'`, 1, 'concurrent identity uniqueness');
+  const isolatedCustomer = await runtimeUpsert(ids.u1, identityConnections.second, 'telegram', 'same-user');
+  if (isolatedCustomer.id === concurrentCustomers[0].id) throw new Error('provider user identity leaked across connections');
+  for (const [message, operation, expectedCode] of [
+    ['provider mismatch accepted', () => runtimeUpsert(ids.u1, identityConnections.first, 'instagram', 'provider-mismatch'), '23503'],
+    ['tenant mismatch accepted', () => runtimeUpsert(ids.u1, identityConnections.otherTenant, 'telegram', 'tenant-mismatch'), '42501'],
+  ]) {
+    let code;
+    try { await operation(); } catch (error) { code = error?.code; }
+    if (code !== expectedCode) throw new Error(`${message}: expected ${expectedCode}, got ${code}`);
+  }
+  const direct = await pool.connect();
+  try {
+    await direct.query('BEGIN'); await direct.query(`SET LOCAL ROLE ${qi(runtimeRole)}`); await direct.query("SELECT set_config('app.user_id',$1,true)", [ids.u1]);
+    for (const statement of [
+      ["INSERT INTO customers(workspace_id,full_name) VALUES($1,'blocked')", [ids.w1]],
+      ["UPDATE customers SET full_name='blocked' WHERE id=$1", [concurrentCustomers[0].id]],
+      ["DELETE FROM customers WHERE id=$1", [concurrentCustomers[0].id]],
+    ]) {
+      await direct.query('SAVEPOINT direct_customer_mutation');
+      let denied = false;
+      try { await direct.query(statement[0], statement[1]); } catch (error) { denied = error?.code === '42501'; await direct.query('ROLLBACK TO SAVEPOINT direct_customer_mutation'); }
+      await direct.query('RELEASE SAVEPOINT direct_customer_mutation');
+      if (!denied) throw new Error('runtime direct customer mutation was not denied');
+    }
+    await direct.query('ROLLBACK');
+  } finally { direct.release(); }
   tx = await pool.connect();
   await tx.query(`SET ROLE ${qi(login)}`);
   await tx.query('BEGIN'); await tx.query(`SET LOCAL ROLE ${qi(runtimeRole)}`); await tx.query("SELECT set_config('app.user_id',$1,true)",[ids.u1]);
