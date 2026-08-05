@@ -13,7 +13,8 @@
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:db": "node scripts/test-db.mjs"
+    "test:db": "node scripts/test-db.mjs",
+    "test:queue:db": "REQUIRE_QUEUE_DATABASE=1 vitest run scripts/test-queue-db.test.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.0",
