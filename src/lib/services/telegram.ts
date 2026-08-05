@@ -44,7 +44,7 @@ export interface TelegramWebhookMessage {
 export class TelegramService {
   private botToken: string;
 
-  constructor(botToken: string) {
+  constructor(botToken: string, private readonly timeoutMs = 10_000) {
     this.botToken = botToken;
   }
 
@@ -62,13 +62,11 @@ export class TelegramService {
         parse_mode: 'HTML',
         reply_markup: options?.reply_markup,
       }),
+      signal: AbortSignal.timeout(this.timeoutMs),
     });
 
-    const data = await res.json();
-    if (!data.ok) {
-      console.error('Telegram API error:', data);
-      throw new Error(`Telegram error: ${data.description}`);
-    }
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) throw TelegramProviderError.fromResponse(res, data);
     return data.result;
   }
 
@@ -82,7 +80,24 @@ export class TelegramService {
         caption,
         parse_mode: 'HTML',
       }),
+      signal: AbortSignal.timeout(this.timeoutMs),
     });
-    return await res.json();
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.ok) throw TelegramProviderError.fromResponse(res, data);
+    return data.result;
+  }
+}
+
+export class TelegramProviderError extends Error {
+  constructor(message: string, readonly retryable: boolean, readonly retryAfterMs?: number) {
+    super(message);
+    this.name = 'TelegramProviderError';
+  }
+
+  static fromResponse(response: Response, body: any) {
+    const seconds = Number(response.headers.get('retry-after') ?? body?.parameters?.retry_after);
+    const retryAfterMs = Number.isFinite(seconds) && seconds > 0 ? seconds * 1_000 : undefined;
+    const retryable = response.status === 429 || response.status >= 500;
+    return new TelegramProviderError(`Telegram request failed (${response.status})`, retryable, retryAfterMs);
   }
 }

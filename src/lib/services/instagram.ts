@@ -26,26 +26,39 @@ export interface InstagramWebhookEvent {
 export class InstagramService {
   private pageAccessToken: string;
 
-  constructor(pageAccessToken: string) {
+  constructor(pageAccessToken: string, private readonly timeoutMs = 10_000) {
     this.pageAccessToken = pageAccessToken;
   }
 
   async sendDirectMessage(recipientId: string, text: string) {
-    const url = `https://graph.facebook.com/v19.0/me/messages?access_token=${this.pageAccessToken}`;
+    const url = 'https://graph.facebook.com/v19.0/me/messages';
     const res = await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${this.pageAccessToken}` },
       body: JSON.stringify({
         recipient: { id: recipientId },
         message: { text },
       }),
+      signal: AbortSignal.timeout(this.timeoutMs),
     });
 
-    const data = await res.json();
-    if (data.error) {
-      console.error('Instagram Graph API error:', data.error);
-      throw new Error(`Instagram error: ${data.error.message}`);
-    }
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.error) throw InstagramProviderError.fromResponse(res, data);
     return data;
+  }
+}
+
+export class InstagramProviderError extends Error {
+  constructor(message: string, readonly retryable: boolean, readonly retryAfterMs?: number) {
+    super(message);
+    this.name = 'InstagramProviderError';
+  }
+
+  static fromResponse(response: Response, body: any) {
+    const seconds = Number(response.headers.get('retry-after'));
+    const retryAfterMs = Number.isFinite(seconds) && seconds > 0 ? seconds * 1_000 : undefined;
+    const code = Number(body?.error?.code);
+    const retryable = response.status === 429 || response.status >= 500 || [1, 2, 4, 17, 32, 613].includes(code);
+    return new InstagramProviderError(`Instagram request failed (${response.status})`, retryable, retryAfterMs);
   }
 }
