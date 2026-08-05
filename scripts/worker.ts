@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import { runWorker } from '../src/lib/workers/runtime';
 import { processInboundEvent, processOutboundJob } from '../src/lib/workers/processors';
 
