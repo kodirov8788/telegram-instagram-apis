@@ -125,7 +125,7 @@ describe('Durable Database Queue Integration Gate', () => {
       expect(deletedRead.some(m => m.messageId === deleteMsgId)).toBe(false);
 
       // 6. Archive test (outbound_messages - test both durable logged queues)
-      const archivePayload = { v: 1 as const, outboundMessageId: randomUUID() };
+      const archivePayload = { v: 1 as const, outboundJobId: randomUUID() };
       const archiveMsgId = await adapter.send(db, 'outbound_messages', archivePayload);
       
       const isArchived = await adapter.archive(db, 'outbound_messages', archiveMsgId);

@@ -67,21 +67,15 @@ export class PgmqQueueAdapter implements QueueAdapter {
       const messages: QueueMessage<T>[] = [];
 
       for (const row of res.rows) {
-        const payload = row.message;
-
-        try {
-          validatePayload(queue, payload);
-        } catch (err: any) {
-          throw new QueueValidationError(`Malformed message payload: ${err.message}`);
-        }
-
         messages.push({
           messageId: BigInt(row.msg_id),
           readCount: Number(row.read_ct),
           enqueuedAt: new Date(row.enqueued_at),
           visibleAt: new Date(row.vt),
           lastReadAt: null,
-          payload: payload as QueuePayload<T>,
+          // Queue contents are an untrusted boundary. Validation belongs to the
+          // per-message worker path so one poison item cannot block its batch.
+          payload: row.message,
         });
       }
 

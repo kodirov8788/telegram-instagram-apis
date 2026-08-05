@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { runtimeRoleTransaction } from '@/lib/db';
+import { PgmqQueueAdapter } from '@/lib/queue/pgmq-adapter';
 
 export interface InsertProviderEventResult {
   id: string | null;
@@ -41,7 +42,14 @@ export async function insertProviderEvent(params: {
         payload,
         payload_hash,
         status
-      ) VALUES ($1, $2, $3, $4, $5, $6, 'received')
+      )
+      SELECT c.workspace_id, c.id, c.channel, $4, $5, $6, 'received'
+      FROM public.channel_connections AS c
+      WHERE c.id = $2
+        AND c.workspace_id = $1
+        AND c.channel = $3
+        AND c.webhook_identifier = $7
+        AND c.is_active = TRUE
       ON CONFLICT (connection_id, provider_event_id) DO NOTHING
       RETURNING id, status
     `;
@@ -53,14 +61,23 @@ export async function insertProviderEvent(params: {
       params.providerEventId,
       serialized,
       payloadHash,
+      params.webhookIdentifier,
     ]);
 
     if (result.rows.length === 0) {
       return { id: null, status: null, isDuplicate: true };
     }
 
+    const eventId = result.rows[0].id as string;
+    // This send uses the same database transaction as the ledger insert. A
+    // queue failure rolls back the event, preventing stranded ledger rows.
+    await new PgmqQueueAdapter().send(client, 'inbound_events', {
+      v: 1,
+      providerEventId: eventId,
+    });
+
     return {
-      id: result.rows[0].id,
+      id: eventId,
       status: result.rows[0].status,
       isDuplicate: false,
     };

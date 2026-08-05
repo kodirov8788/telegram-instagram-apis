@@ -36,9 +36,12 @@ describe('ProviderEvents Service (Unit Tests)', () => {
             }
             dbStore.add(key);
             return {
-              rows: [{ id: 'mocked-event-uuid', status: 'received' }],
+              rows: [{ id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', status: 'received' }],
               rowCount: 1,
             };
+          }
+          if (text.includes('ydeck_queue.send')) {
+            return { rows: [{ msg_id: '42' }], rowCount: 1 };
           }
           return { rows: [], rowCount: 0 };
         }),
@@ -63,7 +66,7 @@ describe('ProviderEvents Service (Unit Tests)', () => {
       });
 
       expect(result).toEqual({
-        id: 'mocked-event-uuid',
+        id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
         status: 'received',
         isDuplicate: false,
       });
@@ -73,6 +76,9 @@ describe('ProviderEvents Service (Unit Tests)', () => {
         text: "SELECT set_config('app.webhook_provider', $1, true)",
         params: ['telegram'],
       });
+      expect(mocks.clientQueries.some(({ text, params }) =>
+        text.includes('ydeck_queue.send') && String(params[1]).includes('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')
+      )).toBe(true);
     });
 
     it('deduplicates a duplicate provider event for the same connection', async () => {
@@ -127,7 +133,7 @@ describe('ProviderEvents Service (Unit Tests)', () => {
       });
 
       expect(res2.isDuplicate).toBe(false);
-      expect(res2.id).toBe('mocked-event-uuid');
+      expect(res2.id).toBe('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa');
     });
 
     it('handles 10 concurrent same-event attempts and inserts only one', async () => {

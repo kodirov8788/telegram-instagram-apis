@@ -40,7 +40,7 @@ describe('Queue Abstraction Layer Unit Tests', () => {
       const inboundPayloadForOutbound = { v: 1, providerEventId: 'a3d65b16-43c3-4d40-84cf-cb5c5cc1baaa' };
       await expect(pgmq.send(dummyClient, 'outbound_messages', inboundPayloadForOutbound as any)).rejects.toThrow(QueueValidationError);
 
-      const outboundPayloadForInbound = { v: 1, outboundMessageId: 'a3d65b16-43c3-4d40-84cf-cb5c5cc1baaa' };
+      const outboundPayloadForInbound = { v: 1, outboundJobId: 'a3d65b16-43c3-4d40-84cf-cb5c5cc1baaa' };
       await expect(pgmq.send(dummyClient, 'inbound_events', outboundPayloadForInbound as any)).rejects.toThrow(QueueValidationError);
     });
 
@@ -50,7 +50,7 @@ describe('Queue Abstraction Layer Unit Tests', () => {
       const id1 = await adapter.send(dummyClient, 'inbound_events', payload1);
       expect(id1).toBe(BigInt(1));
 
-      const payload2 = { v: 1 as const, outboundMessageId: 'b78a9cde-1234-5678-90ab-cdef12345678' };
+      const payload2 = { v: 1 as const, outboundJobId: 'b78a9cde-1234-5678-90ab-cdef12345678' };
       const id2 = await adapter.send(dummyClient, 'outbound_messages', payload2);
       expect(id2).toBe(BigInt(2));
     });

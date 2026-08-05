@@ -10,7 +10,7 @@ export interface InboundPayload {
 
 export interface OutboundPayload {
   v: 1;
-  outboundMessageId: string;
+  outboundJobId: string;
 }
 
 export type QueuePayload<T extends QueueName> =
@@ -22,7 +22,8 @@ export interface QueueMessage<T extends QueueName> {
   enqueuedAt: Date;
   visibleAt: Date;
   lastReadAt?: Date | null;
-  payload: QueuePayload<T>;
+  /** Untrusted until validatePayload is called by the consumer. */
+  payload: unknown;
 }
 
 export interface QueueAdapter {
@@ -74,11 +75,11 @@ export function validatePayload<T extends QueueName>(queue: T, payload: any): as
       throw new QueueValidationError('providerEventId must be a valid UUID');
     }
   } else if (queue === 'outbound_messages') {
-    if (!('outboundMessageId' in payload)) {
-      throw new QueueValidationError('Outbound payload must contain outboundMessageId');
+    if (!('outboundJobId' in payload)) {
+      throw new QueueValidationError('Outbound payload must contain outboundJobId');
     }
-    if (typeof payload.outboundMessageId !== 'string' || !uuidRegex.test(payload.outboundMessageId)) {
-      throw new QueueValidationError('outboundMessageId must be a valid UUID');
+    if (typeof payload.outboundJobId !== 'string' || !uuidRegex.test(payload.outboundJobId)) {
+      throw new QueueValidationError('outboundJobId must be a valid UUID');
     }
   } else {
     throw new QueueValidationError(`Unknown queue: ${queue}`);
