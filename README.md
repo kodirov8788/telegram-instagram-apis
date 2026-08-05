@@ -66,7 +66,8 @@ GitHub Actions automatically runs all quality gates (`npm ci`, `npm run lint`, `
 ## Database deployment
 
 Apply `src/db/schema.sql` for fresh databases, or apply
-`src/db/migrations/002_auth_rbac_rls.sql` to the baseline schema, using the same
+`src/db/migrations/002_auth_rbac_rls.sql` and then
+`src/db/migrations/006_inbound_data_preflight.sql` to the baseline schema, using the same
 login configured in `DATABASE_URL`. The migration creates the fixed
 `ydeck_tenant_runtime_v2` role as `NOLOGIN NOINHERIT` and grants that role to the
 current migration login so runtime `SET LOCAL ROLE` works. The migration login

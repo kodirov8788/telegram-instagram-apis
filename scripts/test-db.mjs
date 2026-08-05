@@ -47,9 +47,39 @@ try {
   await db.query(`SET ROLE ${qi(login)}`);
   const schema = await readFile(new URL('../src/db/schema.sql', import.meta.url), 'utf8');
   const migration = await readFile(new URL('../src/db/migrations/002_auth_rbac_rls.sql', import.meta.url), 'utf8');
+  const migration006 = await readFile(new URL('../src/db/migrations/006_inbound_data_preflight.sql', import.meta.url), 'utf8');
   await db.query(schema);
   await db.query(migration);
   await db.query(migration); // idempotency
+  await db.query(`
+    ALTER TABLE public.customers DROP COLUMN connection_id, DROP COLUMN provider_user_id;
+    ALTER TABLE public.conversations DROP COLUMN connection_id;
+    ALTER TABLE public.messages DROP COLUMN workspace_id, DROP COLUMN provider_event_id;
+  `);
+  await db.query(migration006);
+  await db.query(migration006); // idempotency on a migrated schema
+  const inboundColumns = await db.query(`
+    SELECT table_name, column_name, data_type, is_nullable
+    FROM information_schema.columns
+    WHERE table_schema = 'public' AND (
+      (table_name = 'customers' AND column_name IN ('connection_id', 'provider_user_id')) OR
+      (table_name = 'conversations' AND column_name = 'connection_id') OR
+      (table_name = 'messages' AND column_name IN ('workspace_id', 'provider_event_id'))
+    ) ORDER BY table_name, column_name
+  `);
+  const expectedInboundColumns = [
+    ['conversations', 'connection_id', 'uuid'],
+    ['customers', 'connection_id', 'uuid'],
+    ['customers', 'provider_user_id', 'text'],
+    ['messages', 'provider_event_id', 'uuid'],
+    ['messages', 'workspace_id', 'uuid'],
+  ];
+  if (inboundColumns.rowCount !== expectedInboundColumns.length || inboundColumns.rows.some((row, index) =>
+    row.table_name !== expectedInboundColumns[index][0] ||
+    row.column_name !== expectedInboundColumns[index][1] ||
+    row.data_type !== expectedInboundColumns[index][2] ||
+    row.is_nullable !== 'YES'
+  )) throw new Error(`migration 006 schema parity failed: ${JSON.stringify(inboundColumns.rows)}`);
   await db.query('RESET ROLE');
 
   const attrs = (await db.query('SELECT rolcanlogin,rolinherit,rolsuper,rolbypassrls,rolcreatedb,rolcreaterole,rolreplication FROM pg_roles WHERE rolname=$1', [runtimeRole])).rows[0];
@@ -82,6 +112,39 @@ try {
   await db.query("INSERT INTO conversations(id,workspace_id,customer_id,channel) VALUES($1,$2,$3,'telegram'),($4,$5,$6,'telegram')", [ids.v1,ids.w1,ids.c1,ids.v2,ids.w2,ids.c2]);
   await db.query("INSERT INTO messages(conversation_id,sender,content) VALUES($1,'customer','one'),($2,'customer','two')", [ids.v1,ids.v2]);
 
+  const preflight = {
+    workspace: randomUUID(), ambiguousWorkspace: randomUUID(),
+    connection: randomUUID(), ambiguousConnection1: randomUUID(), ambiguousConnection2: randomUUID(),
+    customer: randomUUID(), ambiguousCustomer: randomUUID(), dualCustomer: randomUUID(),
+    conversation: randomUUID(), ambiguousConversation: randomUUID(), message: randomUUID(),
+  };
+  await db.query("INSERT INTO workspaces(id,name) VALUES($1,'Preflight'),($2,'Ambiguous preflight')", [preflight.workspace, preflight.ambiguousWorkspace]);
+  await db.query("INSERT INTO channel_connections(id,workspace_id,channel,account_identifier,credentials,is_active) VALUES($1,$2,'telegram','single','{}',true),($3,$4,'telegram','ambiguous-1','{}',true),($5,$4,'telegram','ambiguous-2','{}',true)", [preflight.connection, preflight.workspace, preflight.ambiguousConnection1, preflight.ambiguousWorkspace, preflight.ambiguousConnection2]);
+  await db.query("INSERT INTO customers(id,workspace_id,full_name,telegram_id) VALUES($1,$2,'Single','provider-single'),($3,$4,'Ambiguous','provider-ambiguous')", [preflight.customer, preflight.workspace, preflight.ambiguousCustomer, preflight.ambiguousWorkspace]);
+  await db.query("INSERT INTO customers(id,workspace_id,full_name,telegram_id,instagram_id) VALUES($1,$2,'Dual','telegram-dual','instagram-dual')", [preflight.dualCustomer, preflight.workspace]);
+  await db.query("INSERT INTO conversations(id,workspace_id,customer_id,channel) VALUES($1,$2,$3,'telegram'),($4,$5,$6,'telegram')", [preflight.conversation, preflight.workspace, preflight.customer, preflight.ambiguousConversation, preflight.ambiguousWorkspace, preflight.ambiguousCustomer]);
+  await db.query("INSERT INTO messages(id,conversation_id,sender,content) VALUES($1,$2,'customer','preflight')", [preflight.message, preflight.conversation]);
+  await db.query(migration006);
+  await db.query(migration006); // populated backfill rerun
+  const preflightRows = await db.query(`
+    SELECT
+      (SELECT connection_id FROM customers WHERE id=$1) AS customer_connection,
+      (SELECT provider_user_id FROM customers WHERE id=$1) AS customer_provider,
+      (SELECT connection_id FROM customers WHERE id=$2) AS ambiguous_customer_connection,
+      (SELECT provider_user_id FROM customers WHERE id=$2) AS ambiguous_customer_provider,
+      (SELECT connection_id FROM customers WHERE id=$3) AS dual_customer_connection,
+      (SELECT connection_id FROM conversations WHERE id=$4) AS conversation_connection,
+      (SELECT connection_id FROM conversations WHERE id=$5) AS ambiguous_conversation_connection,
+      (SELECT workspace_id FROM messages WHERE id=$6) AS message_workspace
+  `, [preflight.customer, preflight.ambiguousCustomer, preflight.dualCustomer, preflight.conversation, preflight.ambiguousConversation, preflight.message]);
+  const result = preflightRows.rows[0];
+  if (result.customer_connection !== preflight.connection || result.customer_provider !== 'provider-single' ||
+      result.ambiguous_customer_connection !== null || result.ambiguous_customer_provider !== null ||
+      result.dual_customer_connection !== null || result.conversation_connection !== preflight.connection ||
+      result.ambiguous_conversation_connection !== null || result.message_workspace !== preflight.workspace) {
+    throw new Error(`migration 006 safe backfill failed: ${JSON.stringify(result)}`);
+  }
+
   pool = new Pool({ connectionString: testUrl.toString(), max: 1 });
   tx = await pool.connect();
   await tx.query(`SET ROLE ${qi(login)}`);
@@ -109,7 +172,7 @@ try {
   if (pool) await pool.end().catch(error => cleanupErrors.push(error));
   if (db) await db.end().catch(error => cleanupErrors.push(error));
   try {
-    if (dbCreated) { await admin.query(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname=$1`, [dbName]); await admin.query(`DROP DATABASE IF EXISTS ${qi(dbName)}`); }
+    if (dbCreated) await admin.query(`DROP DATABASE IF EXISTS ${qi(dbName)} WITH (FORCE)`);
     if (roleExisted && loginCreated) await admin.query(`REVOKE ADMIN OPTION FOR ${qi(runtimeRole)} FROM ${qi(login)}`).catch(() => {});
     if (loginCreated) await admin.query(`DROP ROLE IF EXISTS ${qi(login)}`);
     if (!roleExisted) await admin.query(`DROP ROLE IF EXISTS ${qi(runtimeRole)}`);
