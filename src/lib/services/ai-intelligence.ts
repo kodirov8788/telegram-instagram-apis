@@ -55,12 +55,23 @@ export class AIIntelligenceService {
       conversation = newConv.rows[0];
     }
 
-    // Save inbound message
-    await query(
-      `INSERT INTO messages (conversation_id, sender, content, message_type, delivery_status)
-       VALUES ($1, 'customer', $2, $3, 'delivered')`,
-      [conversation.id, msg.content, msg.messageType]
+    // Save inbound message. When this message came through the inbound
+    // worker (msg.providerEventId set), the partial unique index on
+    // messages.provider_event_id makes this insert a no-op for a
+    // redelivered/re-processed event instead of creating a duplicate
+    // customer-facing message; when absent (direct callers, tests), this
+    // behaves exactly as before.
+    const inboundInsert = await query(
+      `INSERT INTO messages (conversation_id, sender, content, message_type, delivery_status, provider_event_id)
+       VALUES ($1, 'customer', $2, $3, 'delivered', $4)
+       ON CONFLICT (provider_event_id) WHERE provider_event_id IS NOT NULL DO NOTHING
+       RETURNING id`,
+      [conversation.id, msg.content, msg.messageType, msg.providerEventId || null]
     );
+    if (msg.providerEventId && inboundInsert.rowCount === 0) {
+      // Already fully processed this exact provider event; nothing further to do.
+      return;
+    }
 
     // 3. Evaluate Escalation Triggers (Human Handoff)
     const isEscalationTrigger = 
