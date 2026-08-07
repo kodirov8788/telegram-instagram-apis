@@ -7,6 +7,8 @@ export interface UnifiedMessageDTO {
   content: string;
   messageType: 'text' | 'image' | 'document' | 'voice' | 'location' | 'contact';
   rawPayload: any;
+  /** Resolved `channel_connections.id` for the connection this message arrived on, when known. */
+  connectionId?: string;
 }
 
 export class MessageNormalizerService {
@@ -43,7 +45,11 @@ export class MessageNormalizerService {
     };
   }
 
-  static normalizeInstagramMessage(workspaceId: string, messagingEntry: any): UnifiedMessageDTO | null {
+  static normalizeInstagramMessage(
+    workspaceId: string,
+    messagingEntry: any,
+    connectionId?: string
+  ): UnifiedMessageDTO | null {
     const msg = messagingEntry.message;
     if (!msg) return null;
 
@@ -63,6 +69,7 @@ export class MessageNormalizerService {
       content,
       messageType,
       rawPayload: messagingEntry,
+      connectionId,
     };
   }
 }
