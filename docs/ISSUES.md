@@ -8,15 +8,15 @@
 
 ## EPIC 1: Workspace & Core Infrastructure Setup
 
-- [ ] **ISSUE-01: Project Environment Setup & Tech Stack Initialization**
+- [x] **ISSUE-01: Project Environment Setup & Tech Stack Initialization**
   - **Goal:** Initialize project structure (Next.js 14+ / Fastify API Server, TypeScript, TailwindCSS, ESLint, Prettier, Environment validation).
   - **Deliverables:** Working dev server, folder architecture (`src/app`, `src/api`, `src/lib`, `src/db`), build scripts.
 
-- [ ] **ISSUE-02: Database Schema Design & Supabase PostgreSQL Migration**
+- [x] **ISSUE-02: Database Schema Design & Supabase PostgreSQL Migration**
   - **Goal:** Design and execute database migrations for Workspaces, Users, Roles (Owner, Admin, Sales Manager, Sales Rep, Support Operator, Analyst), Channels, Customers, Conversations, Messages, Leads, Knowledge Items, and Audit Logs.
   - **Deliverables:** Drizzle/Prisma schema files or raw SQL migrations with pgvector extension enabled.
 
-- [ ] **ISSUE-03: Workspace Management & Multi-Tenancy Isolation Middleware**
+- [x] **ISSUE-03: Workspace Management & Multi-Tenancy Isolation Middleware**
   - **Goal:** Build workspace creation, user invitations, role-based authorization middleware (RBAC), and working hours / language settings configuration API.
   - **Deliverables:** REST/GraphQL API endpoints for workspace configuration and tenant isolation middleware.
 
@@ -24,11 +24,11 @@
 
 ## EPIC 2: Communication Channels Integration Layer
 
-- [ ] **ISSUE-04: Telegram Bot Integration Module**
+- [x] **ISSUE-04: Telegram Bot Integration Module**
   - **Goal:** Connect Telegram Bot API via Webhooks. Build webhook signature validator, incoming message handler, and outbound message dispatcher (text, photos, documents).
   - **Deliverables:** `POST /api/webhooks/telegram` endpoint and `TelegramChannelService`.
 
-- [ ] **ISSUE-05: Telegram Special Media & Interactive Payload Handlers**
+- [x] **ISSUE-05: Telegram Special Media & Interactive Payload Handlers**
   - **Goal:** Parse voice messages (transcription trigger), contact sharing, location payloads, and render inline quick-reply buttons.
   - **Deliverables:** Handlers for Telegram attachment types and interactive button triggers.
 
