@@ -9,10 +9,12 @@ export interface UnifiedMessageDTO {
   rawPayload: any;
   /** Resolved `channel_connections.id` for the connection this message arrived on, when known. */
   connectionId?: string;
+  /** `provider_events.id` this message was normalized from, when processed via the inbound worker. Used for dedup. */
+  providerEventId?: string;
 }
 
 export class MessageNormalizerService {
-  static normalizeTelegramMessage(workspaceId: string, payload: any): UnifiedMessageDTO | null {
+  static normalizeTelegramMessage(workspaceId: string, payload: any, connectionId?: string): UnifiedMessageDTO | null {
     const msg = payload.message;
     if (!msg) return null;
 
@@ -42,6 +44,7 @@ export class MessageNormalizerService {
       content,
       messageType,
       rawPayload: payload,
+      connectionId,
     };
   }
 

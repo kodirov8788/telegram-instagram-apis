@@ -1,8 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { MessageNormalizerService } from '@/lib/services/message-queue';
-import { AIIntelligenceService } from '@/lib/services/ai-intelligence';
 import { verifyMetaSignature } from '@/lib/security/meta-signature';
 import { resolveChannelConnection } from '@/lib/services/webhook-connection-resolver';
+import { insertProviderEvent } from '@/lib/services/provider-events';
 
 // GET endpoint for Meta Webhook verification handshake
 export async function GET(req: NextRequest) {
@@ -26,7 +25,14 @@ export async function GET(req: NextRequest) {
   return new Response('Forbidden', { status: 403 });
 }
 
-// POST endpoint for Meta Instagram incoming message events
+// POST endpoint for Meta Instagram incoming message events.
+//
+// This only authenticates the delivery, resolves its owning connection,
+// records it in the provider_events ledger (which also enqueues it), and
+// acknowledges — it does not run AI processing inline. That happens in the
+// background via the inbound worker (src/lib/workers/processors/inbound.ts),
+// so a slow/unavailable AI call can never make Meta's webhook delivery
+// time out or retry-storm this endpoint.
 export async function POST(req: NextRequest) {
   // Read the raw body first — verification must run over the exact bytes
   // Meta signed. Parsing to JSON before verifying would make the raw bytes
@@ -62,21 +68,23 @@ export async function POST(req: NextRequest) {
         }
 
         for (const messagingEntry of entry.messaging || []) {
-          const normalized = MessageNormalizerService.normalizeInstagramMessage(
-            connection.workspaceId,
-            messagingEntry,
-            connection.connectionId
-          );
-          if (normalized) {
-            await AIIntelligenceService.processIncomingMessage(normalized);
-          }
+          const providerEventId = messagingEntry?.message?.mid;
+          if (!providerEventId) continue; // postbacks etc. — not a message event, nothing to queue yet
+
+          await insertProviderEvent({
+            workspaceId: connection.workspaceId,
+            connectionId: connection.connectionId,
+            provider: 'instagram',
+            providerEventId,
+            payload: messagingEntry,
+          });
         }
       }
     }
 
     return NextResponse.json({ status: 'EVENT_RECEIVED' });
   } catch (error: any) {
-    console.error('Error processing Instagram webhook:', error);
+    console.error('Error recording Instagram webhook event:', error);
     return NextResponse.json({ error: error.message }, { status: 500 });
   }
 }
