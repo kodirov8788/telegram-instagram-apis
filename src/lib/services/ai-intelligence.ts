@@ -4,6 +4,7 @@ import { KnowledgeBaseService } from './knowledge-base';
 import { TelegramService } from './telegram';
 import { InstagramService } from './instagram';
 import { AuditLogService } from './audit-log';
+import { InboundPersistenceService } from './inbound-persistence';
 import pool, { query } from '../db';
 
 export class AIIntelligenceService {
@@ -13,66 +14,41 @@ export class AIIntelligenceService {
     // 1. Classify language, intent, sentiment, and extract lead info
     const classification = await AIClassifierService.classifyMessage(msg.content);
 
-    // 2. Check or upsert Customer & Conversation record
-    const customerRes = await query(
-      `INSERT INTO customers (workspace_id, full_name, ${msg.channel}_username, ${msg.channel}_id, preferred_language, connection_id, provider_user_id, last_contact_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
-       ON CONFLICT DO UPDATE SET last_contact_at = NOW()
-       RETURNING id`,
-      [
-        msg.workspaceId,
-        msg.senderName || 'Customer',
-        msg.username,
-        msg.channelUserIdentifier,
-        classification.language,
-        msg.connectionId || null,
-        msg.connectionId ? msg.channelUserIdentifier : null,
-      ]
-    );
-    const customerId = customerRes.rows[0]?.id;
-
-    // Check active conversation status
-    const convRes = await query(
-      `SELECT * FROM conversations WHERE workspace_id = $1 AND customer_id = $2 AND channel = $3 ORDER BY last_message_at DESC LIMIT 1`,
-      [msg.workspaceId, customerId, msg.channel]
-    );
-
-    let conversation = convRes.rows[0];
-    if (!conversation) {
-      const newConv = await query(
-        `INSERT INTO conversations (workspace_id, customer_id, channel, connection_id, status, mode, detected_language, detected_intent, sentiment)
-         VALUES ($1, $2, $3, $4, 'new', 'auto', $5, $6, $7)
-         RETURNING *`,
-        [
-          msg.workspaceId,
-          customerId,
-          msg.channel,
-          msg.connectionId || null,
-          classification.language,
-          classification.intent,
-          classification.sentiment,
-        ]
-      );
-      conversation = newConv.rows[0];
+    // 2. Atomically upsert the customer, resolve-or-create the active
+    // conversation, and insert the inbound message (migration 012's
+    // persist_inbound_message). This replaces three separate query() calls
+    // that previously left a real interleaving window between the customer
+    // upsert and the conversation lookup. The only trust anchor is
+    // msg.connectionId — the function derives workspace_id server-side from
+    // the real, active channel_connections row; msg.workspaceId is not
+    // trusted for this write.
+    if (!msg.connectionId) {
+      throw new Error('processIncomingMessage requires msg.connectionId to resolve the tenant workspace');
     }
+    const persisted = await InboundPersistenceService.persist({
+      connectionId: msg.connectionId,
+      provider: msg.channel,
+      providerUserId: msg.channelUserIdentifier,
+      content: msg.content,
+      messageType: msg.messageType,
+      fullName: msg.senderName || 'Customer',
+      username: msg.username,
+      detectedLanguage: classification.language,
+      detectedIntent: classification.intent,
+      sentiment: classification.sentiment,
+      providerEventId: msg.providerEventId,
+    });
 
-    // Save inbound message. When this message came through the inbound
-    // worker (msg.providerEventId set), the partial unique index on
-    // messages.provider_event_id makes this insert a no-op for a
-    // redelivered/re-processed event instead of creating a duplicate
-    // customer-facing message; when absent (direct callers, tests), this
-    // behaves exactly as before.
-    const inboundInsert = await query(
-      `INSERT INTO messages (conversation_id, sender, content, message_type, delivery_status, provider_event_id)
-       VALUES ($1, 'customer', $2, $3, 'delivered', $4)
-       ON CONFLICT (provider_event_id) WHERE provider_event_id IS NOT NULL DO NOTHING
-       RETURNING id`,
-      [conversation.id, msg.content, msg.messageType, msg.providerEventId || null]
-    );
-    if (msg.providerEventId && inboundInsert.rowCount === 0) {
+    if (persisted.isDuplicateEvent) {
       // Already fully processed this exact provider event; nothing further to do.
       return;
     }
+
+    const conversation = {
+      id: persisted.conversationId,
+      mode: persisted.conversationMode,
+      status: persisted.conversationStatus,
+    };
 
     // 3. Evaluate Escalation Triggers (Human Handoff)
     const isEscalationTrigger = 
