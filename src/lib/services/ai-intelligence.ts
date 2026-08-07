@@ -14,11 +14,19 @@ export class AIIntelligenceService {
 
     // 2. Check or upsert Customer & Conversation record
     const customerRes = await query(
-      `INSERT INTO customers (workspace_id, full_name, ${msg.channel}_username, ${msg.channel}_id, preferred_language, last_contact_at)
-       VALUES ($1, $2, $3, $4, $5, NOW())
+      `INSERT INTO customers (workspace_id, full_name, ${msg.channel}_username, ${msg.channel}_id, preferred_language, connection_id, provider_user_id, last_contact_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
        ON CONFLICT DO UPDATE SET last_contact_at = NOW()
        RETURNING id`,
-      [msg.workspaceId, msg.senderName || 'Customer', msg.username, msg.channelUserIdentifier, classification.language]
+      [
+        msg.workspaceId,
+        msg.senderName || 'Customer',
+        msg.username,
+        msg.channelUserIdentifier,
+        classification.language,
+        msg.connectionId || null,
+        msg.connectionId ? msg.channelUserIdentifier : null,
+      ]
     );
     const customerId = customerRes.rows[0]?.id;
 
@@ -31,10 +39,18 @@ export class AIIntelligenceService {
     let conversation = convRes.rows[0];
     if (!conversation) {
       const newConv = await query(
-        `INSERT INTO conversations (workspace_id, customer_id, channel, status, mode, detected_language, detected_intent, sentiment)
-         VALUES ($1, $2, $3, 'new', 'auto', $4, $5, $6)
+        `INSERT INTO conversations (workspace_id, customer_id, channel, connection_id, status, mode, detected_language, detected_intent, sentiment)
+         VALUES ($1, $2, $3, $4, 'new', 'auto', $5, $6, $7)
          RETURNING *`,
-        [msg.workspaceId, customerId, msg.channel, classification.language, classification.intent, classification.sentiment]
+        [
+          msg.workspaceId,
+          customerId,
+          msg.channel,
+          msg.connectionId || null,
+          classification.language,
+          classification.intent,
+          classification.sentiment,
+        ]
       );
       conversation = newConv.rows[0];
     }
@@ -116,11 +132,32 @@ export class AIIntelligenceService {
         await tg.sendMessage(msg.channelUserIdentifier, text);
       }
     } else if (msg.channel === 'instagram') {
-      const token = process.env.INSTAGRAM_PAGE_ACCESS_TOKEN || '';
+      const token = await this.resolveInstagramAccessToken(msg.connectionId);
       if (token) {
         const ig = new InstagramService(token);
         await ig.sendDirectMessage(msg.channelUserIdentifier, text);
       }
     }
+  }
+
+  /**
+   * Prefers the workspace's own connection-scoped Instagram page access
+   * token (from `channel_connections.credentials`) over the single global
+   * `INSTAGRAM_PAGE_ACCESS_TOKEN` env var, so each workspace sends from its
+   * own connected account. Falls back to the env var only when no
+   * connection-scoped credential is available, to avoid a hard regression
+   * for any existing manual/test usage that never went through a resolved
+   * connection.
+   */
+  private static async resolveInstagramAccessToken(connectionId?: string): Promise<string> {
+    if (connectionId) {
+      const res = await query(
+        `SELECT credentials FROM channel_connections WHERE id = $1 AND is_active = TRUE`,
+        [connectionId]
+      );
+      const token = res.rows[0]?.credentials?.pageAccessToken;
+      if (token) return token;
+    }
+    return process.env.INSTAGRAM_PAGE_ACCESS_TOKEN || '';
   }
 }
