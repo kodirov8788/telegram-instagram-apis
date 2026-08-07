@@ -4,6 +4,7 @@ vi.mock('../../db', () => ({ query: vi.fn(), default: { connect: vi.fn() } }));
 vi.mock('../ai-classifier', () => ({ AIClassifierService: { classifyMessage: vi.fn() } }));
 vi.mock('../knowledge-base', () => ({ KnowledgeBaseService: { searchRelevantKnowledge: vi.fn() } }));
 vi.mock('../audit-log', () => ({ AuditLogService: { logEvent: vi.fn() } }));
+vi.mock('../inbound-persistence', () => ({ InboundPersistenceService: { persist: vi.fn() } }));
 
 const mocks = vi.hoisted(() => ({
   sendMessage: vi.fn().mockResolvedValue({ message_id: 1 }),
@@ -17,6 +18,7 @@ import { query } from '../../db';
 import { AIClassifierService } from '../ai-classifier';
 import { KnowledgeBaseService } from '../knowledge-base';
 import { AuditLogService } from '../audit-log';
+import { InboundPersistenceService } from '../inbound-persistence';
 import { AIIntelligenceService } from '../ai-intelligence';
 import type { UnifiedMessageDTO } from '../message-queue';
 
@@ -24,6 +26,7 @@ const db = vi.mocked(query);
 const classify = vi.mocked(AIClassifierService.classifyMessage);
 const search = vi.mocked(KnowledgeBaseService.searchRelevantKnowledge);
 const audit = vi.mocked(AuditLogService.logEvent);
+const persist = vi.mocked(InboundPersistenceService.persist);
 
 const baseMsg: UnifiedMessageDTO = {
   workspaceId: 'ws-1',
@@ -32,10 +35,10 @@ const baseMsg: UnifiedMessageDTO = {
   content: 'What are your hours?',
   messageType: 'text',
   rawPayload: {},
+  connectionId: 'conn-1',
 };
 
 const NON_ESCALATING = { language: 'en', intent: 'general_inquiry', sentiment: 'neutral', confidenceScore: 0.9 };
-const conversationRow = (mode: string) => ({ id: 'conv-1', status: 'ai_handling', mode, workspace_id: 'ws-1', channel: 'telegram' });
 
 const originalEnv = { ...process.env };
 
@@ -44,6 +47,7 @@ beforeEach(() => {
   classify.mockReset();
   search.mockReset();
   audit.mockReset();
+  persist.mockReset();
   sendMessage.mockClear();
   sendDirectMessage.mockClear();
   classify.mockResolvedValue(NON_ESCALATING as never);
@@ -51,11 +55,16 @@ beforeEach(() => {
   process.env = { ...originalEnv, TELEGRAM_BOT_TOKEN: 'test-telegram-token' };
 });
 
-/** Wires the standard non-escalating, existing-conversation query sequence, then returns the mock for further chaining (e.g. the fresh mode read). */
+/** Wires the standard non-escalating, existing-conversation persist() result, then returns the mock for further chaining (e.g. the fresh mode read). */
 function primeStandardFlow(initialMode: string) {
-  db.mockResolvedValueOnce({ rows: [{ id: 'cust-1' }] } as never); // customer upsert
-  db.mockResolvedValueOnce({ rows: [conversationRow(initialMode)] } as never); // existing conversation
-  db.mockResolvedValueOnce({ rows: [{ id: 'msg-inbound-1' }], rowCount: 1 } as never); // inbound message insert
+  persist.mockResolvedValueOnce({
+    customerId: 'cust-1',
+    conversationId: 'conv-1',
+    conversationMode: initialMode as never,
+    conversationStatus: 'ai_handling',
+    messageId: 'msg-inbound-1',
+    isDuplicateEvent: false,
+  });
 }
 
 describe('AIIntelligenceService.processIncomingMessage — mode routing', () => {
@@ -133,5 +142,34 @@ describe('AIIntelligenceService.processIncomingMessage — mode routing', () => 
       c => typeof c[0] === 'string' && (c[0].includes("'ai', $2, 'text', 'pending'") || c[0].includes('pending_approval') || c[0].includes('suggested'))
     );
     expect(aiInsertAttempted).toBe(false);
+  });
+
+  it('duplicate provider event: persist() signals isDuplicateEvent and the rest of the pipeline is skipped', async () => {
+    persist.mockResolvedValueOnce({
+      customerId: 'cust-1',
+      conversationId: 'conv-1',
+      conversationMode: 'auto',
+      conversationStatus: 'ai_handling',
+      messageId: null,
+      isDuplicateEvent: true,
+    });
+
+    await AIIntelligenceService.processIncomingMessage({ ...baseMsg, providerEventId: 'evt-1' });
+
+    expect(search).not.toHaveBeenCalled();
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(sendDirectMessage).not.toHaveBeenCalled();
+    expect(db).not.toHaveBeenCalled();
+  });
+
+  it('throws without dispatching or persisting anything when msg.connectionId is missing', async () => {
+    const { connectionId, ...msgWithoutConnection } = baseMsg;
+
+    await expect(AIIntelligenceService.processIncomingMessage(msgWithoutConnection as UnifiedMessageDTO)).rejects.toThrow(
+      'connectionId'
+    );
+
+    expect(persist).not.toHaveBeenCalled();
+    expect(sendMessage).not.toHaveBeenCalled();
   });
 });
