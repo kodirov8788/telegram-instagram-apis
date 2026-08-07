@@ -8,15 +8,15 @@
 
 ## EPIC 1: Workspace & Core Infrastructure Setup
 
-- [ ] **ISSUE-01: Project Environment Setup & Tech Stack Initialization**
+- [x] **ISSUE-01: Project Environment Setup & Tech Stack Initialization**
   - **Goal:** Initialize project structure (Next.js 14+ / Fastify API Server, TypeScript, TailwindCSS, ESLint, Prettier, Environment validation).
   - **Deliverables:** Working dev server, folder architecture (`src/app`, `src/api`, `src/lib`, `src/db`), build scripts.
 
-- [ ] **ISSUE-02: Database Schema Design & Supabase PostgreSQL Migration**
+- [x] **ISSUE-02: Database Schema Design & Supabase PostgreSQL Migration**
   - **Goal:** Design and execute database migrations for Workspaces, Users, Roles (Owner, Admin, Sales Manager, Sales Rep, Support Operator, Analyst), Channels, Customers, Conversations, Messages, Leads, Knowledge Items, and Audit Logs.
   - **Deliverables:** Drizzle/Prisma schema files or raw SQL migrations with pgvector extension enabled.
 
-- [ ] **ISSUE-03: Workspace Management & Multi-Tenancy Isolation Middleware**
+- [x] **ISSUE-03: Workspace Management & Multi-Tenancy Isolation Middleware**
   - **Goal:** Build workspace creation, user invitations, role-based authorization middleware (RBAC), and working hours / language settings configuration API.
   - **Deliverables:** REST/GraphQL API endpoints for workspace configuration and tenant isolation middleware.
 
@@ -24,11 +24,11 @@
 
 ## EPIC 2: Communication Channels Integration Layer
 
-- [ ] **ISSUE-04: Telegram Bot Integration Module**
+- [x] **ISSUE-04: Telegram Bot Integration Module**
   - **Goal:** Connect Telegram Bot API via Webhooks. Build webhook signature validator, incoming message handler, and outbound message dispatcher (text, photos, documents).
   - **Deliverables:** `POST /api/webhooks/telegram` endpoint and `TelegramChannelService`.
 
-- [ ] **ISSUE-05: Telegram Special Media & Interactive Payload Handlers**
+- [x] **ISSUE-05: Telegram Special Media & Interactive Payload Handlers**
   - **Goal:** Parse voice messages (transcription trigger), contact sharing, location payloads, and render inline quick-reply buttons.
   - **Deliverables:** Handlers for Telegram attachment types and interactive button triggers.
 
@@ -84,19 +84,19 @@
 
 ## EPIC 5: Lead Capture, Qualification & Follow-up Automation
 
-- [ ] **ISSUE-16: Automated Lead Extraction Engine**
+- [x] **ISSUE-16: Automated Lead Extraction Engine**
   - **Goal:** Parse natural language chat context to extract structured lead fields: full name, phone number, email, requested product/service, budget, location, and purchase timeline.
   - **Deliverables:** Background entity extractor pipeline updating `Lead` entity.
 
-- [ ] **ISSUE-17: Configurable Lead Qualification & Scoring System**
+- [x] **ISSUE-17: Configurable Lead Qualification & Scoring System**
   - **Goal:** Calculate lead score based on configurable criteria (budget presence, clear intent, contact provided) and assign status: Unqualified, New, Interested, Qualified, High Priority, Lost.
   - **Deliverables:** Lead scoring service & lead list management UI.
 
-- [ ] **ISSUE-18: Automated Conversation Summarizer**
+- [x] **ISSUE-18: Automated Conversation Summarizer**
   - **Goal:** Auto-generate structured conversation summaries (customer request, products discussed, questions answered, objections, required next action).
   - **Deliverables:** LLM conversation summary generator updating live in chat details.
 
-- [ ] **ISSUE-19: Rule-Based Follow-Up Automation Engine**
+- [x] **ISSUE-19: Rule-Based Follow-Up Automation Engine**
   - **Goal:** Build background job scheduler for rule-based follow-ups (e.g., non-responsive qualified lead after 24h, post-service feedback request, appointment reminder) with opt-out compliance.
   - **Deliverables:** BullMQ follow-up cron scheduler & execution engine.
 
