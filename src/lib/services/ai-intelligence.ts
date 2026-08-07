@@ -3,6 +3,7 @@ import { AIClassifierService } from './ai-classifier';
 import { KnowledgeBaseService } from './knowledge-base';
 import { TelegramService } from './telegram';
 import { InstagramService } from './instagram';
+import { AuditLogService } from './audit-log';
 import pool, { query } from '../db';
 
 export class AIIntelligenceService {
@@ -122,20 +123,81 @@ export class AIIntelligenceService {
         : "Afsuski, bu savol bo'yicha aniq ma'lumotga ega emasman. So'rovingizni menejerga yo'naltiraman.";
     }
 
-    // Save AI message to database
-    await query(
+    // 6. Route by control mode (ISSUE-11). Re-read mode fresh here rather
+    // than trusting the `conversation` object fetched at step 2 — the AI
+    // classification, knowledge retrieval, and response synthesis above can
+    // take seconds, long enough for a human operator to change the mode
+    // (e.g. take the conversation over) mid-flight. Deciding on a stale
+    // value could send an AI reply after a human already took control.
+    const modeRes = await query(`SELECT mode FROM conversations WHERE id = $1`, [conversation.id]);
+    const currentMode: 'auto' | 'approval' | 'suggestion' | 'human' | undefined = modeRes.rows[0]?.mode;
+
+    if (currentMode === 'human') {
+      // A human took over while this reply was being generated. Drop it —
+      // sending it now would contradict the handoff that already happened.
+      return;
+    }
+
+    if (currentMode === 'approval' || currentMode === 'suggestion') {
+      // Only the newest AI-generated message per conversation is ever
+      // actionable: superseding older pending drafts/suggestions here means
+      // an operator can never approve or act on stale AI output once a
+      // newer customer message has produced a newer reply. The supersede
+      // and the new-draft insert are one CTE statement, not two separate
+      // query() calls — Postgres executes a WITH...INSERT atomically, so a
+      // second concurrent processIncomingMessage run on the same
+      // conversation can't interleave between them and leave two "live"
+      // drafts.
+      const draftStatus = currentMode === 'approval' ? 'pending_approval' : 'suggested';
+      const inserted = await query(
+        `WITH superseded AS (
+           UPDATE messages SET delivery_status = 'stale'
+           WHERE conversation_id = $1 AND delivery_status IN ('pending_approval', 'suggested')
+         )
+         INSERT INTO messages (conversation_id, sender, content, message_type, delivery_status, ai_confidence)
+         VALUES ($1, 'ai', $2, 'text', $3, $4)
+         RETURNING id`,
+        [conversation.id, aiReplyText, draftStatus, classification.confidenceScore]
+      );
+
+      await AuditLogService.logEvent({
+        workspaceId: msg.workspaceId,
+        actorType: 'ai_agent',
+        action: currentMode === 'approval' ? 'message.draft_created' : 'message.suggestion_created',
+        entityType: 'message',
+        entityId: inserted.rows[0]?.id,
+        newValue: { conversationId: conversation.id, deliveryStatus: draftStatus },
+      });
+      return;
+    }
+
+    // 'auto': insert as 'pending' and only flip to 'sent' after dispatch
+    // actually succeeds — not before. Marking it 'sent' first (the prior
+    // behavior) meant a dispatch failure left a permanently mislabeled row
+    // that claims delivery which never happened, with nothing surfacing the
+    // failure. This also can't be silently retried today (the
+    // provider_event_id dedup at the top of this function short-circuits
+    // before reaching this code on any redelivery of the same inbound
+    // event), so on failure this records 'failed' rather than leaving the
+    // wrong status — automatic redispatch is future work, tracked with the
+    // outbound-jobs queue explicitly deferred in ISSUE-07's PR.
+    const aiInsert = await query(
       `INSERT INTO messages (conversation_id, sender, content, message_type, delivery_status, ai_confidence)
-       VALUES ($1, 'ai', $2, 'text', 'sent', $3)`,
+       VALUES ($1, 'ai', $2, 'text', 'pending', $3)
+       RETURNING id`,
       [conversation.id, aiReplyText, classification.confidenceScore]
     );
-
-    // 6. Send Response if Mode is 'auto'
-    if (conversation.mode === 'auto') {
+    try {
       await this.dispatchOutboundMessage(msg, aiReplyText);
+      await query(`UPDATE messages SET delivery_status = 'sent' WHERE id = $1`, [aiInsert.rows[0]?.id]);
+    } catch (error) {
+      await query(`UPDATE messages SET delivery_status = 'failed' WHERE id = $1`, [aiInsert.rows[0]?.id]);
+      throw error;
     }
   }
 
-  private static async dispatchOutboundMessage(msg: UnifiedMessageDTO, text: string) {
+  /** Public: also called by the approve-draft API route once a pending_approval message is approved. */
+  static async dispatchOutboundMessage(msg: UnifiedMessageDTO, text: string) {
     if (msg.channel === 'telegram') {
       const token = process.env.TELEGRAM_BOT_TOKEN || '';
       if (token) {
