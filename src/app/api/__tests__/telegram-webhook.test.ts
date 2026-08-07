@@ -10,6 +10,7 @@ import { POST } from '../webhooks/telegram/route';
 
 const db = vi.mocked(query);
 const insert = vi.mocked(insertProviderEvent);
+const SECRET = 'whsec_test_123';
 
 beforeEach(() => {
   db.mockReset();
@@ -17,9 +18,15 @@ beforeEach(() => {
   insert.mockResolvedValue({ id: 'event-1', status: 'queued', isDuplicate: false });
 });
 
-const req = (url: string, body: unknown) => new NextRequest(url, { method: 'POST', body: JSON.stringify(body) });
+const req = (url: string, body: unknown, headers: Record<string, string> = {}) =>
+  new NextRequest(url, { method: 'POST', body: JSON.stringify(body), headers });
 
-describe('Telegram webhook POST (fast-ack + enqueue)', () => {
+const withSecretConnection = () =>
+  db.mockResolvedValueOnce({
+    rows: [{ id: 'conn-1', workspace_id: 'ws-1', credentials: { webhookSecret: SECRET } }],
+  } as never);
+
+describe('Telegram webhook POST (fast-ack + enqueue, secret-token authenticated)', () => {
   it('rejects a request with no connection identifier', async () => {
     const res = await POST(req('https://app.test/api/webhooks/telegram', { update_id: 1 }));
     expect(res.status).toBe(400);
@@ -40,14 +47,59 @@ describe('Telegram webhook POST (fast-ack + enqueue)', () => {
     expect(insert).not.toHaveBeenCalled();
   });
 
-  it('resolves the connection and records the event in the ledger instead of processing it inline', async () => {
-    db.mockResolvedValueOnce({ rows: [{ id: 'conn-1', workspace_id: 'ws-1', credentials: {} }] } as never);
+  it('rejects a resolvable connection when no secret-token header is sent (no cross-tenant injection via a guessed public bot username)', async () => {
+    withSecretConnection();
 
     const res = await POST(
       req('https://app.test/api/webhooks/telegram?connection=some_bot', {
-        update_id: 42,
+        update_id: 1,
         message: { from: { id: 1, first_name: 'A' }, text: 'hi' },
       })
+    );
+
+    expect(res.status).toBe(401);
+    expect(insert).not.toHaveBeenCalled();
+  });
+
+  it('rejects a wrong secret-token header', async () => {
+    withSecretConnection();
+
+    const res = await POST(
+      req(
+        'https://app.test/api/webhooks/telegram?connection=some_bot',
+        { update_id: 1, message: { from: { id: 1, first_name: 'A' }, text: 'hi' } },
+        { 'x-telegram-bot-api-secret-token': 'wrong-secret' }
+      )
+    );
+
+    expect(res.status).toBe(401);
+    expect(insert).not.toHaveBeenCalled();
+  });
+
+  it('rejects when the connection has no secret configured (fails closed, never accepts an unverifiable request)', async () => {
+    db.mockResolvedValueOnce({ rows: [{ id: 'conn-1', workspace_id: 'ws-1', credentials: {} }] } as never);
+
+    const res = await POST(
+      req(
+        'https://app.test/api/webhooks/telegram?connection=some_bot',
+        { update_id: 1, message: { from: { id: 1, first_name: 'A' }, text: 'hi' } },
+        { 'x-telegram-bot-api-secret-token': 'anything' }
+      )
+    );
+
+    expect(res.status).toBe(401);
+    expect(insert).not.toHaveBeenCalled();
+  });
+
+  it('resolves the connection and records the event in the ledger when the secret token matches', async () => {
+    withSecretConnection();
+
+    const res = await POST(
+      req(
+        'https://app.test/api/webhooks/telegram?connection=some_bot',
+        { update_id: 42, message: { from: { id: 1, first_name: 'A' }, text: 'hi' } },
+        { 'x-telegram-bot-api-secret-token': SECRET }
+      )
     );
 
     expect(res.status).toBe(200);
@@ -56,10 +108,12 @@ describe('Telegram webhook POST (fast-ack + enqueue)', () => {
     );
   });
 
-  it('does not enqueue non-message updates (e.g. missing update_id or message)', async () => {
-    db.mockResolvedValueOnce({ rows: [{ id: 'conn-1', workspace_id: 'ws-1', credentials: {} }] } as never);
+  it('does not enqueue non-message updates even with a valid secret token', async () => {
+    withSecretConnection();
 
-    const res = await POST(req('https://app.test/api/webhooks/telegram?connection=some_bot', { update_id: 1 }));
+    const res = await POST(
+      req('https://app.test/api/webhooks/telegram?connection=some_bot', { update_id: 1 }, { 'x-telegram-bot-api-secret-token': SECRET })
+    );
 
     expect(res.status).toBe(200);
     expect(insert).not.toHaveBeenCalled();

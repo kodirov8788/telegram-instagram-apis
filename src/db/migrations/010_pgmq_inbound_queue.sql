@@ -8,18 +8,31 @@
 BEGIN;
 
 DO $do$
-DECLARE pgmq_version text;
+DECLARE pgmq_available_version text;
 BEGIN
-    SELECT extversion INTO pgmq_version FROM pg_available_extensions WHERE name = 'pgmq';
-    IF pgmq_version IS NULL THEN
+    -- pg_available_extensions lists what CAN be installed (default_version),
+    -- not what IS installed (that's pg_extension.extversion, checked below
+    -- after CREATE EXTENSION — a prior install could differ from the
+    -- default if this database already had an older pgmq).
+    SELECT default_version INTO pgmq_available_version FROM pg_available_extensions WHERE name = 'pgmq';
+    IF pgmq_available_version IS NULL THEN
         RAISE EXCEPTION 'pgmq extension is not available on this Postgres instance';
-    END IF;
-    IF split_part(pgmq_version, '.', 1)::int NOT IN (1) THEN
-        RAISE EXCEPTION 'unexpected pgmq major version %; verify compatibility before proceeding', pgmq_version;
     END IF;
 END $do$;
 
 CREATE EXTENSION IF NOT EXISTS pgmq;
+
+DO $do$
+DECLARE pgmq_installed_version text;
+BEGIN
+    SELECT extversion INTO pgmq_installed_version FROM pg_extension WHERE extname = 'pgmq';
+    IF pgmq_installed_version IS NULL THEN
+        RAISE EXCEPTION 'pgmq extension failed to install';
+    END IF;
+    IF split_part(pgmq_installed_version, '.', 1)::int NOT IN (1) THEN
+        RAISE EXCEPTION 'unexpected pgmq major version %; verify compatibility before proceeding', pgmq_installed_version;
+    END IF;
+END $do$;
 
 SELECT pgmq.create('inbound_events') WHERE NOT EXISTS (
     SELECT 1 FROM pgmq.list_queues() WHERE queue_name = 'inbound_events'
@@ -65,7 +78,11 @@ BEGIN
     IF p_qty IS NULL OR p_qty < 1 OR p_qty > 5 THEN
         RAISE EXCEPTION 'batch quantity must be between 1 and 5';
     END IF;
-    RETURN QUERY SELECT * FROM pgmq.read(p_queue, p_visibility_timeout, p_qty);
+    -- Explicit column list, not SELECT * — pgmq.message_record has gained
+    -- columns across versions (e.g. `headers`); naming only what this
+    -- wrapper's callers need keeps it stable across a pgmq upgrade instead
+    -- of breaking on a return-type mismatch.
+    RETURN QUERY SELECT r.msg_id, r.read_ct, r.enqueued_at, r.vt, r.message FROM pgmq.read(p_queue, p_visibility_timeout, p_qty) r;
 END;
 $fn$;
 

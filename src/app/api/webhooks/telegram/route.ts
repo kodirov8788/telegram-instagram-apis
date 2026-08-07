@@ -1,16 +1,19 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { resolveChannelConnection } from '@/lib/services/webhook-connection-resolver';
 import { insertProviderEvent } from '@/lib/services/provider-events';
+import { secretsMatch } from '@/lib/security/webhook-secret';
 
 // POST endpoint for Telegram Bot API incoming updates.
 //
-// Note: this route resolves its connection (required — provider_events.
-// connection_id has a NOT NULL foreign key into channel_connections, so an
-// event can't be ledgered without one) but does not add Telegram webhook
-// signature verification (`X-Telegram-Bot-Api-Secret-Token`). That's a
-// separate, still-open auth gap (pre-existing, same class of issue PR #67
-// fixed for Instagram) — out of scope for this change, which is about the
-// inbound queue/dedup/retry pipeline, not Telegram-specific auth hardening.
+// Authenticated via Telegram's `X-Telegram-Bot-Api-Secret-Token` header: set
+// once per bot via `setWebhook({ secret_token })` and echoed back on every
+// delivery. The `connection` query param identifies which bot (its
+// account_identifier is public — a Telegram bot username — so resolving it
+// alone proves nothing); the secret token, stored in that connection's
+// credentials and known only to whoever configured the webhook, is what
+// actually authorizes queueing work under that workspace. Without this
+// check, anyone who knows or guesses a workspace's public bot username
+// could inject fabricated "customer" messages into that workspace's queue.
 export async function POST(req: NextRequest) {
   const identifier = req.nextUrl.searchParams.get('connection');
   if (!identifier) {
@@ -29,6 +32,12 @@ export async function POST(req: NextRequest) {
     if (!connection) {
       console.warn(`Telegram webhook: no active connection for identifier ${identifier}; ignoring update.`);
       return NextResponse.json({ status: 'ok' });
+    }
+
+    const expectedSecret = connection.credentials?.webhookSecret;
+    const providedSecret = req.headers.get('x-telegram-bot-api-secret-token');
+    if (typeof expectedSecret !== 'string' || !secretsMatch(expectedSecret, providedSecret)) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
     // update_id is unique per bot per Telegram update; not present on every
