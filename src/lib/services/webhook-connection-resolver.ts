@@ -3,7 +3,6 @@ import { query } from '../db';
 export interface ResolvedChannelConnection {
   connectionId: string;
   workspaceId: string;
-  credentials: Record<string, unknown>;
 }
 
 /**
@@ -18,7 +17,14 @@ export interface ResolvedChannelConnection {
  * (e.g. a page not yet connected to any workspace).
  *
  * Channel-agnostic by design so it can be reused by other channel webhooks;
- * only the Instagram route consumes it today.
+ * only the Instagram and Telegram routes consume it today.
+ *
+ * Deliberately does NOT return `credentials` (plaintext or otherwise) —
+ * this resolver is only for tenant/connection identification. Callers that
+ * need the connection's actual secret (e.g. the Telegram webhook's
+ * secret-token check) must go through
+ * `connection-secret-loader#getConnectionSecret`, which is Vault-aware and
+ * fails closed.
  */
 export async function resolveChannelConnection(
   channel: 'telegram' | 'instagram',
@@ -27,7 +33,7 @@ export async function resolveChannelConnection(
   if (!accountIdentifier) return null;
 
   const res = await query(
-    `SELECT id, workspace_id, credentials
+    `SELECT id, workspace_id
      FROM channel_connections
      WHERE channel = $1 AND account_identifier = $2 AND is_active = TRUE
      LIMIT 1`,
@@ -40,6 +46,5 @@ export async function resolveChannelConnection(
   return {
     connectionId: row.id,
     workspaceId: row.workspace_id,
-    credentials: row.credentials || {},
   };
 }

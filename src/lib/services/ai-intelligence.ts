@@ -5,6 +5,7 @@ import { TelegramService } from './telegram';
 import { InstagramService } from './instagram';
 import { AuditLogService } from './audit-log';
 import pool, { query } from '../db';
+import { getConnectionSecret } from './connection-secret-loader';
 
 export class AIIntelligenceService {
   static async processIncomingMessage(msg: UnifiedMessageDTO) {
@@ -199,13 +200,13 @@ export class AIIntelligenceService {
   /** Public: also called by the approve-draft API route once a pending_approval message is approved. */
   static async dispatchOutboundMessage(msg: UnifiedMessageDTO, text: string) {
     if (msg.channel === 'telegram') {
-      const token = process.env.TELEGRAM_BOT_TOKEN || '';
+      const token = await this.resolveTelegramBotToken(msg.connectionId, msg.workspaceId);
       if (token) {
         const tg = new TelegramService(token);
         await tg.sendMessage(msg.channelUserIdentifier, text);
       }
     } else if (msg.channel === 'instagram') {
-      const token = await this.resolveInstagramAccessToken(msg.connectionId);
+      const token = await this.resolveInstagramAccessToken(msg.connectionId, msg.workspaceId);
       if (token) {
         const ig = new InstagramService(token);
         await ig.sendDirectMessage(msg.channelUserIdentifier, text);
@@ -215,22 +216,34 @@ export class AIIntelligenceService {
 
   /**
    * Prefers the workspace's own connection-scoped Instagram page access
-   * token (from `channel_connections.credentials`) over the single global
+   * token (via `getConnectionSecret`, Vault-backed with a transitional
+   * plaintext fallback — see migration 014) over the single global
    * `INSTAGRAM_PAGE_ACCESS_TOKEN` env var, so each workspace sends from its
    * own connected account. Falls back to the env var only when no
    * connection-scoped credential is available, to avoid a hard regression
    * for any existing manual/test usage that never went through a resolved
    * connection.
    */
-  private static async resolveInstagramAccessToken(connectionId?: string): Promise<string> {
-    if (connectionId) {
-      const res = await query(
-        `SELECT credentials FROM channel_connections WHERE id = $1 AND is_active = TRUE`,
-        [connectionId]
-      );
-      const token = res.rows[0]?.credentials?.pageAccessToken;
-      if (token) return token;
+  private static async resolveInstagramAccessToken(connectionId?: string, workspaceId?: string): Promise<string> {
+    if (connectionId && workspaceId) {
+      const secret = await getConnectionSecret(connectionId, workspaceId);
+      const token = secret?.pageAccessToken;
+      if (typeof token === 'string' && token) return token;
     }
     return process.env.INSTAGRAM_PAGE_ACCESS_TOKEN || '';
+  }
+
+  /**
+   * Mirrors `resolveInstagramAccessToken`'s fallback shape for Telegram:
+   * prefers a connection-scoped bot token, falls back to the global
+   * `TELEGRAM_BOT_TOKEN` env var when the connection has none.
+   */
+  private static async resolveTelegramBotToken(connectionId?: string, workspaceId?: string): Promise<string> {
+    if (connectionId && workspaceId) {
+      const secret = await getConnectionSecret(connectionId, workspaceId);
+      const token = secret?.botToken;
+      if (typeof token === 'string' && token) return token;
+    }
+    return process.env.TELEGRAM_BOT_TOKEN || '';
   }
 }
