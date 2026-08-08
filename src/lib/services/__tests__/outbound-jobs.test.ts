@@ -10,6 +10,7 @@ import {
   markRetryableFailed,
   markPermanentFailed,
   markAmbiguous,
+  markDispatched,
   DuplicateActiveJobError,
   InvalidJobTransitionError,
 } from '../outbound-jobs';
@@ -55,6 +56,7 @@ function makeDb() {
         last_error: null,
         next_attempt_at: new Date(0),
         sent_at: null,
+        dispatched_at: null,
         created_at: new Date(),
         updated_at: new Date(),
       };
@@ -100,6 +102,14 @@ function makeDb() {
       if (!row || row.status !== 'processing') return { rows: [] };
       row.status = 'permanent_failed';
       row.last_error = err;
+      return { rows: [row] };
+    }
+
+    if (text.startsWith('UPDATE outbound_jobs') && text.includes('dispatched_at = NOW()') && text.includes('dispatched_at IS NULL')) {
+      const [id] = params as string[];
+      const row = rows.get(id);
+      if (!row || row.status !== 'processing' || row.dispatched_at !== null) return { rows: [] };
+      row.dispatched_at = new Date();
       return { rows: [row] };
     }
 
@@ -268,5 +278,31 @@ describe('outbound-jobs service', () => {
     const ambiguous = await markAmbiguous(job.id, 'timed out after dispatch');
 
     expect(ambiguous.status).toBe('ambiguous');
+  });
+
+  describe('dispatched_at (ambiguous-delivery protection)', () => {
+    it('markDispatched sets dispatched_at exactly once for a processing job', async () => {
+      const db = makeDb();
+      mocks.query.mockImplementation(db.query);
+      const job = await createJob(jobInput());
+      await claimNextJob();
+
+      const first = await markDispatched(job.id);
+      const second = await markDispatched(job.id);
+
+      expect(first).toBe(true);
+      expect(second).toBe(false); // already dispatched — never set twice
+      expect(db.rows.get(job.id)?.dispatched_at).not.toBeNull();
+    });
+
+    it('markDispatched returns false for a job not currently processing', async () => {
+      const db = makeDb();
+      mocks.query.mockImplementation(db.query);
+      const job = await createJob(jobInput()); // still pending, never claimed
+
+      const result = await markDispatched(job.id);
+
+      expect(result).toBe(false);
+    });
   });
 });

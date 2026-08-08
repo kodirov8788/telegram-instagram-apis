@@ -1,14 +1,22 @@
 import type { DbClient } from '../db';
-import { QueueAdapter, QueueName, QueuePayload, QueueMessage, validatePayload } from './contracts';
+import { QueueAdapter, QueueName, QueuePayload, QueueMessage, validatePayload, validateOutboundPayload } from './contracts';
 import { QueueValidationError } from './errors';
 
-const QUEUE = 'inbound_events' as const;
+const KNOWN_QUEUES: readonly QueueName[] = ['inbound_events', 'outbound_jobs'];
 
-/** Thin wrapper over the `ydeck_queue.*` SQL functions (see migration 010). */
+function assertKnownQueue(queue: QueueName): void {
+  if (!KNOWN_QUEUES.includes(queue)) throw new QueueValidationError(`Unknown queue: ${queue}`);
+}
+
+/** Thin wrapper over the `ydeck_queue.*` SQL functions (see migrations 010, 016). */
 export class PgmqQueueAdapter implements QueueAdapter {
   async send(client: DbClient, queue: QueueName, payload: QueuePayload, delaySeconds = 0): Promise<bigint> {
-    if (queue !== QUEUE) throw new QueueValidationError(`Unknown queue: ${queue}`);
-    validatePayload(payload);
+    assertKnownQueue(queue);
+    if (queue === 'inbound_events') {
+      validatePayload(payload);
+    } else {
+      validateOutboundPayload(payload);
+    }
     if (!Number.isInteger(delaySeconds) || delaySeconds < 0) {
       throw new QueueValidationError('delaySeconds must be an integer >= 0');
     }
@@ -26,7 +34,7 @@ export class PgmqQueueAdapter implements QueueAdapter {
     queue: QueueName,
     options?: { visibilityTimeout?: number; limit?: number }
   ): Promise<QueueMessage[]> {
-    if (queue !== QUEUE) throw new QueueValidationError(`Unknown queue: ${queue}`);
+    assertKnownQueue(queue);
     const visibilityTimeout = options?.visibilityTimeout ?? 900;
     const limit = options?.limit ?? 5;
     if (!Number.isInteger(visibilityTimeout) || visibilityTimeout < 1) {
@@ -52,13 +60,13 @@ export class PgmqQueueAdapter implements QueueAdapter {
   }
 
   async delete(client: DbClient, queue: QueueName, id: bigint): Promise<boolean> {
-    if (queue !== QUEUE) throw new QueueValidationError(`Unknown queue: ${queue}`);
+    assertKnownQueue(queue);
     const res = await client.query('SELECT ydeck_queue.delete($1, $2::bigint) AS success', [queue, id.toString()]);
     return Boolean(res.rows[0]?.success);
   }
 
   async archive(client: DbClient, queue: QueueName, id: bigint): Promise<boolean> {
-    if (queue !== QUEUE) throw new QueueValidationError(`Unknown queue: ${queue}`);
+    assertKnownQueue(queue);
     const res = await client.query('SELECT ydeck_queue.archive($1, $2::bigint) AS success', [queue, id.toString()]);
     return Boolean(res.rows[0]?.success);
   }

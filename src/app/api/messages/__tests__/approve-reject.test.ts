@@ -9,9 +9,16 @@ vi.mock('@/lib/db', () => ({
 }));
 vi.mock('@/lib/services/audit-log', () => ({ AuditLogService: { logEvent: vi.fn() } }));
 
-const mocks = vi.hoisted(() => ({ dispatchOutboundMessage: vi.fn().mockResolvedValue(undefined) }));
-vi.mock('@/lib/services/ai-intelligence', () => ({ AIIntelligenceService: { dispatchOutboundMessage: mocks.dispatchOutboundMessage } }));
-const dispatchOutboundMessage = mocks.dispatchOutboundMessage;
+const mocks = vi.hoisted(() => {
+  class MockDuplicateActiveJobError extends Error {}
+  return { createJobAndEnqueue: vi.fn().mockResolvedValue({ id: 'job-1' }), MockDuplicateActiveJobError };
+});
+vi.mock('@/lib/services/outbound-jobs', () => ({
+  createJobAndEnqueue: mocks.createJobAndEnqueue,
+  DuplicateActiveJobError: mocks.MockDuplicateActiveJobError,
+}));
+const createJobAndEnqueue = mocks.createJobAndEnqueue;
+const MockDuplicateActiveJobError = mocks.MockDuplicateActiveJobError;
 
 import { query } from '@/lib/db';
 import { AuditLogService } from '@/lib/services/audit-log';
@@ -35,11 +42,12 @@ const member = (role = 'support_operator') => db.mockResolvedValueOnce({ rows: [
 beforeEach(() => {
   db.mockReset();
   audit.mockReset();
-  dispatchOutboundMessage.mockClear();
+  createJobAndEnqueue.mockClear();
+  createJobAndEnqueue.mockResolvedValue({ id: 'job-1' });
 });
 
 describe('POST /api/messages/:id/approve', () => {
-  it('approves a pending draft, dispatches exactly once, and audit-logs it', async () => {
+  it('approves a pending draft, creates exactly one outbound job, and audit-logs it', async () => {
     session();
     member();
     db.mockResolvedValueOnce({
@@ -47,20 +55,24 @@ describe('POST /api/messages/:id/approve', () => {
         id: mid, content: 'Our hours are 9-6.', conversation_id: 'conv-1', channel: 'telegram',
         connection_id: 'conn-1', workspace_id: wid, telegram_id: 'tg-user-1', instagram_id: null,
       }],
-    } as never); // atomic claim UPDATE, commits 'approved' before any dispatch is attempted
-    db.mockResolvedValueOnce({ rows: [] } as never); // follow-up UPDATE -> 'sent', outside the claim transaction
+    } as never); // atomic claim UPDATE, commits 'approved' before job creation is attempted
 
     const res = await approve(req(`https://app.test/api/messages/${mid}/approve`), ctx);
 
     expect(res.status).toBe(200);
-    expect(dispatchOutboundMessage).toHaveBeenCalledTimes(1);
-    expect(dispatchOutboundMessage).toHaveBeenCalledWith(expect.objectContaining({ channelUserIdentifier: 'tg-user-1' }), 'Our hours are 9-6.');
+    expect(createJobAndEnqueue).toHaveBeenCalledTimes(1);
+    expect(createJobAndEnqueue).toHaveBeenCalledWith(expect.objectContaining({
+      messageId: mid,
+      recipientId: 'tg-user-1',
+      channel: 'telegram',
+      connectionId: 'conn-1',
+      workspaceId: wid,
+      content: 'Our hours are 9-6.',
+    }));
     expect(audit).toHaveBeenCalledWith(expect.objectContaining({ action: 'message.approved', entityId: mid }));
-    const sentUpdate = db.mock.calls.find(c => typeof c[0] === 'string' && c[0].includes("delivery_status = 'sent'"));
-    expect(sentUpdate).toBeTruthy();
   });
 
-  it('marks the message failed (not left as approved-but-silent) if dispatch fails after the approval already committed', async () => {
+  it('marks the message failed (not left as approved-but-silent) if job creation fails after the approval already committed', async () => {
     session();
     member();
     db.mockResolvedValueOnce({
@@ -70,7 +82,7 @@ describe('POST /api/messages/:id/approve', () => {
       }],
     } as never);
     db.mockResolvedValueOnce({ rows: [] } as never); // follow-up UPDATE -> 'failed'
-    dispatchOutboundMessage.mockRejectedValueOnce(new Error('telegram unavailable'));
+    createJobAndEnqueue.mockRejectedValueOnce(new Error('db unavailable'));
 
     const res = await approve(req(`https://app.test/api/messages/${mid}/approve`), ctx);
 
@@ -78,9 +90,25 @@ describe('POST /api/messages/:id/approve', () => {
     const failedUpdate = db.mock.calls.find(c => typeof c[0] === 'string' && c[0].includes("delivery_status = 'failed'"));
     expect(failedUpdate).toBeTruthy();
     expect(failedUpdate![1]).toEqual([mid]);
-    // The approval itself was already committed and is not retried/re-approvable from this call.
-    const sentUpdate = db.mock.calls.find(c => typeof c[0] === 'string' && c[0].includes("delivery_status = 'sent'"));
-    expect(sentUpdate).toBeFalsy();
+  });
+
+  it('does not create a second job when createJobAndEnqueue reports a duplicate active job (concurrent approval race)', async () => {
+    session();
+    member();
+    db.mockResolvedValueOnce({
+      rows: [{
+        id: mid, content: 'Our hours are 9-6.', conversation_id: 'conv-1', channel: 'telegram',
+        connection_id: 'conn-1', workspace_id: wid, telegram_id: 'tg-user-1', instagram_id: null,
+      }],
+    } as never);
+    createJobAndEnqueue.mockRejectedValueOnce(new MockDuplicateActiveJobError('dup'));
+
+    const res = await approve(req(`https://app.test/api/messages/${mid}/approve`), ctx);
+
+    expect(res.status).toBe(200);
+    expect(createJobAndEnqueue).toHaveBeenCalledTimes(1);
+    const failedUpdate = db.mock.calls.find(c => typeof c[0] === 'string' && c[0].includes("delivery_status = 'failed'"));
+    expect(failedUpdate).toBeFalsy();
   });
 
   it('rejects a duplicate/concurrent approve of the same message (already-resolved row matches 0 rows)', async () => {
@@ -92,7 +120,7 @@ describe('POST /api/messages/:id/approve', () => {
     const res = await approve(req(`https://app.test/api/messages/${mid}/approve`), ctx);
 
     expect(res.status).toBe(409);
-    expect(dispatchOutboundMessage).not.toHaveBeenCalled();
+    expect(createJobAndEnqueue).not.toHaveBeenCalled();
   });
 
   it('rejects approving a draft whose conversation has moved to human mode', async () => {
@@ -104,7 +132,7 @@ describe('POST /api/messages/:id/approve', () => {
     const res = await approve(req(`https://app.test/api/messages/${mid}/approve`), ctx);
 
     expect(res.status).toBe(409);
-    expect(dispatchOutboundMessage).not.toHaveBeenCalled();
+    expect(createJobAndEnqueue).not.toHaveBeenCalled();
   });
 
   it('returns 404 for a message that does not exist in this workspace', async () => {
@@ -119,7 +147,7 @@ describe('POST /api/messages/:id/approve', () => {
 });
 
 describe('POST /api/messages/:id/reject', () => {
-  it('rejects a pending draft with a reason and never dispatches', async () => {
+  it('rejects a pending draft with a reason and never creates a job', async () => {
     session();
     member();
     db.mockResolvedValueOnce({ rows: [{ id: mid, conversation_id: 'conv-1' }] } as never);
@@ -127,7 +155,7 @@ describe('POST /api/messages/:id/reject', () => {
     const res = await reject(req(`https://app.test/api/messages/${mid}/reject`, { reason: 'Wrong price quoted' }), ctx);
 
     expect(res.status).toBe(200);
-    expect(dispatchOutboundMessage).not.toHaveBeenCalled();
+    expect(createJobAndEnqueue).not.toHaveBeenCalled();
     expect(audit).toHaveBeenCalledWith(expect.objectContaining({ action: 'message.rejected', entityId: mid }));
     expect(db.mock.calls.some(c => Array.isArray(c[1]) && c[1].includes('Wrong price quoted'))).toBe(true);
   });

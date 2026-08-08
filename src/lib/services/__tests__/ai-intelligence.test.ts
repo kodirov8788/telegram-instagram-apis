@@ -14,6 +14,10 @@ vi.mock('../telegram', () => ({ TelegramService: class { sendMessage = mocks.sen
 vi.mock('../instagram', () => ({ InstagramService: class { sendDirectMessage = mocks.sendDirectMessage; } }));
 const { sendMessage, sendDirectMessage } = mocks;
 
+const jobMocks = vi.hoisted(() => ({ createJobAndEnqueue: vi.fn().mockResolvedValue({ id: 'job-1' }) }));
+vi.mock('../outbound-jobs', () => ({ createJobAndEnqueue: jobMocks.createJobAndEnqueue }));
+const { createJobAndEnqueue } = jobMocks;
+
 import { query } from '../../db';
 import { AIClassifierService } from '../ai-classifier';
 import { KnowledgeBaseService } from '../knowledge-base';
@@ -50,6 +54,8 @@ beforeEach(() => {
   persist.mockReset();
   sendMessage.mockClear();
   sendDirectMessage.mockClear();
+  createJobAndEnqueue.mockClear();
+  createJobAndEnqueue.mockResolvedValue({ id: 'job-1' });
   classify.mockResolvedValue(NON_ESCALATING as never);
   search.mockResolvedValue([] as never);
   process.env = { ...originalEnv, TELEGRAM_BOT_TOKEN: 'test-telegram-token' };
@@ -68,30 +74,40 @@ function primeStandardFlow(initialMode: string) {
 }
 
 describe('AIIntelligenceService.processIncomingMessage — mode routing', () => {
-  it('auto mode: inserts pending, dispatches, then flips to sent only after dispatch succeeds', async () => {
+  it('auto mode: inserts pending, creates exactly one outbound job, and never calls the provider synchronously', async () => {
     primeStandardFlow('auto');
     db.mockResolvedValueOnce({ rows: [{ mode: 'auto' }] } as never); // fresh mode re-read
+    db.mockResolvedValueOnce({
+      rows: [{ workspace_id: 'ws-1', connection_id: 'conn-1', channel: 'telegram', recipient_id: 'tg-user-1' }],
+    } as never); // conversations JOIN customers lookup
     db.mockResolvedValueOnce({ rows: [{ id: 'ai-msg-1' }] } as never); // AI message insert (status: pending)
-    db.mockResolvedValueOnce({ rows: [] } as never); // UPDATE -> 'sent' after successful dispatch
 
     await AIIntelligenceService.processIncomingMessage(baseMsg);
 
-    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(createJobAndEnqueue).toHaveBeenCalledTimes(1);
+    expect(createJobAndEnqueue).toHaveBeenCalledWith(expect.objectContaining({
+      workspaceId: 'ws-1',
+      connectionId: 'conn-1',
+      channel: 'telegram',
+      messageId: 'ai-msg-1',
+      recipientId: 'tg-user-1',
+    }));
     const pendingInsert = db.mock.calls.find(c => typeof c[0] === 'string' && c[0].includes("'ai', $2, 'text', 'pending'"));
     expect(pendingInsert).toBeTruthy();
-    const sentUpdate = db.mock.calls.find(c => typeof c[0] === 'string' && c[0].includes("delivery_status = 'sent'"));
-    expect(sentUpdate).toBeTruthy();
-    expect(sentUpdate![1]).toEqual(['ai-msg-1']);
   });
 
-  it('auto mode: marks the message failed (not sent) if dispatch throws, and rethrows', async () => {
+  it('auto mode: marks the message failed (not sent) if job creation throws, and rethrows', async () => {
     primeStandardFlow('auto');
     db.mockResolvedValueOnce({ rows: [{ mode: 'auto' }] } as never);
+    db.mockResolvedValueOnce({
+      rows: [{ workspace_id: 'ws-1', connection_id: 'conn-1', channel: 'telegram', recipient_id: 'tg-user-1' }],
+    } as never);
     db.mockResolvedValueOnce({ rows: [{ id: 'ai-msg-2' }] } as never); // AI message insert (status: pending)
     db.mockResolvedValueOnce({ rows: [] } as never); // UPDATE -> 'failed'
-    sendMessage.mockRejectedValueOnce(new Error('telegram down'));
+    createJobAndEnqueue.mockRejectedValueOnce(new Error('queue unavailable'));
 
-    await expect(AIIntelligenceService.processIncomingMessage(baseMsg)).rejects.toThrow('telegram down');
+    await expect(AIIntelligenceService.processIncomingMessage(baseMsg)).rejects.toThrow('queue unavailable');
 
     const failedUpdate = db.mock.calls.find(c => typeof c[0] === 'string' && c[0].includes("delivery_status = 'failed'"));
     expect(failedUpdate).toBeTruthy();
@@ -109,6 +125,7 @@ describe('AIIntelligenceService.processIncomingMessage — mode routing', () => 
 
     expect(sendMessage).not.toHaveBeenCalled();
     expect(sendDirectMessage).not.toHaveBeenCalled();
+    expect(createJobAndEnqueue).not.toHaveBeenCalled();
     const draftInsert = db.mock.calls.find(c => typeof c[0] === 'string' && c[0].includes('WITH superseded AS'));
     expect(draftInsert).toBeTruthy();
     expect(draftInsert![0]).toContain("delivery_status = 'stale'");
@@ -124,6 +141,7 @@ describe('AIIntelligenceService.processIncomingMessage — mode routing', () => 
     await AIIntelligenceService.processIncomingMessage(baseMsg);
 
     expect(sendMessage).not.toHaveBeenCalled();
+    expect(createJobAndEnqueue).not.toHaveBeenCalled();
     expect(audit).toHaveBeenCalledWith(expect.objectContaining({ action: 'message.suggestion_created', entityId: 'suggestion-1' }));
   });
 
@@ -138,6 +156,7 @@ describe('AIIntelligenceService.processIncomingMessage — mode routing', () => 
 
     expect(sendMessage).not.toHaveBeenCalled();
     expect(sendDirectMessage).not.toHaveBeenCalled();
+    expect(createJobAndEnqueue).not.toHaveBeenCalled();
     const aiInsertAttempted = db.mock.calls.some(
       c => typeof c[0] === 'string' && (c[0].includes("'ai', $2, 'text', 'pending'") || c[0].includes('pending_approval') || c[0].includes('suggested'))
     );

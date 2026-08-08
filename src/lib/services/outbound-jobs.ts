@@ -1,4 +1,7 @@
-import { query } from '../db';
+import pool, { query, DbClient } from '../db';
+import { PgmqQueueAdapter } from '../queue/pgmq-adapter';
+
+const adapter = new PgmqQueueAdapter();
 
 export type OutboundChannel = 'telegram' | 'instagram';
 
@@ -24,6 +27,7 @@ export interface OutboundJob {
   lastError: string | null;
   nextAttemptAt: Date;
   sentAt: Date | null;
+  dispatchedAt: Date | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -80,6 +84,7 @@ function mapRow(row: any): OutboundJob {
     lastError: row.last_error,
     nextAttemptAt: row.next_attempt_at,
     sentAt: row.sent_at,
+    dispatchedAt: row.dispatched_at ?? null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -95,9 +100,10 @@ function mapRow(row: any): OutboundJob {
  * to create one raises `DuplicateActiveJobError` instead of silently
  * succeeding or double-enqueuing a send.
  */
-export async function createJob(input: CreateOutboundJobInput): Promise<OutboundJob> {
+export async function createJob(input: CreateOutboundJobInput, client?: DbClient): Promise<OutboundJob> {
+  const runner = client ?? { query: (text: string, params?: any[]) => query(text, params) };
   try {
-    const result = await query(
+    const result = await runner.query(
       `INSERT INTO outbound_jobs (workspace_id, connection_id, channel, message_id, recipient_id, content)
        VALUES ($1, $2, $3, $4, $5, $6)
        RETURNING *`,
@@ -110,6 +116,69 @@ export async function createJob(input: CreateOutboundJobInput): Promise<Outbound
     }
     throw error;
   }
+}
+
+/**
+ * Creates the job row and publishes `{v:1, outboundJobId}` to the
+ * `outbound_jobs` pgmq queue in a single DB transaction — mirroring
+ * `provider-events.ts`'s `insertProviderEvent`, which does the identical
+ * "ledger insert + ydeck_queue.send in one transaction" pattern for
+ * inbound. pgmq's `send` is itself a table insert under the hood (migration
+ * 010), so it can safely participate in the same local-DB transaction as
+ * the job insert — no network call is made here, so no long-held
+ * transaction risk. Duplicate-active-job protection (the partial unique
+ * index) still applies: a second attempt for the same message rolls the
+ * whole transaction back and raises `DuplicateActiveJobError`, so no
+ * partial "job created but not enqueued" state is possible.
+ */
+export async function createJobAndEnqueue(input: CreateOutboundJobInput): Promise<OutboundJob> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    let job: OutboundJob;
+    try {
+      const result = await client.query(
+        `INSERT INTO outbound_jobs (workspace_id, connection_id, channel, message_id, recipient_id, content)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         RETURNING *`,
+        [input.workspaceId, input.connectionId, input.channel, input.messageId, input.recipientId, input.content]
+      );
+      job = mapRow(result.rows[0]);
+    } catch (error: any) {
+      await client.query('ROLLBACK');
+      if (error?.code === UNIQUE_VIOLATION) {
+        throw new DuplicateActiveJobError(input.messageId);
+      }
+      throw error;
+    }
+    await adapter.send(client, 'outbound_jobs', { v: 1, outboundJobId: job.id });
+    await client.query('COMMIT');
+    return job;
+  } catch (error) {
+    // Rollback is a no-op if already rolled back above.
+    try { await client.query('ROLLBACK'); } catch { /* ignore */ }
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Ambiguous-delivery protection (issue #46): atomically marks a claimed
+ * job as "about to call the provider" immediately before the network call
+ * is made. Returns false if the job was already dispatched (someone else's
+ * attempt got here first, or a reclaim already routed this attempt away
+ * from ever calling the provider) — callers must skip the provider call
+ * when this returns false.
+ */
+export async function markDispatched(jobId: string): Promise<boolean> {
+  const result = await query(
+    `UPDATE outbound_jobs SET dispatched_at = NOW(), updated_at = NOW()
+     WHERE id = $1 AND status = 'processing' AND dispatched_at IS NULL
+     RETURNING id`,
+    [jobId]
+  );
+  return Boolean(result.rows[0]);
 }
 
 /**

@@ -1,17 +1,24 @@
 import { queueWorkerTransaction } from './transaction';
 import { PgmqQueueAdapter } from '../queue/pgmq-adapter';
-import { QueueAdapter, QueueName, InboundPayload, validatePayload } from '../queue/contracts';
+import { QueueAdapter, QueueName, QueuePayload, extractPayloadId } from '../queue/contracts';
 import { RetryableWorkError } from './errors';
 
 export interface WorkerRuntimeOptions {
   queue: QueueName;
-  process: (providerEventId: string) => Promise<unknown>;
+  /** Receives the id extracted from the queue's payload (providerEventId for inbound_events, outboundJobId for outbound_jobs). */
+  process: (payloadId: string) => Promise<unknown>;
   signal?: AbortSignal;
   visibilityTimeout?: number;
   maxAttempts?: number;
   pollIntervalMs?: number;
   logger?: Pick<Console, 'info' | 'error'>;
   adapter?: QueueAdapter;
+  /**
+   * Extracts and validates the payload's id for `options.queue`. Defaults
+   * to `extractPayloadId(options.queue, payload)`, which already validates
+   * shape per-queue (see contracts.ts) — override only for tests/mocks.
+   */
+  extractId?: (payload: unknown) => string;
 }
 
 /**
@@ -26,16 +33,16 @@ export interface WorkerRuntimeOptions {
 export async function processWorkerBatch(options: WorkerRuntimeOptions): Promise<number> {
   const adapter = options.adapter ?? new PgmqQueueAdapter();
   const maxAttempts = options.maxAttempts ?? 8;
+  const extractId = options.extractId ?? ((payload: unknown) => extractPayloadId(options.queue, payload));
   const messages = await queueWorkerTransaction(client =>
     adapter.read(client, options.queue, { visibilityTimeout: options.visibilityTimeout ?? 900, limit: 5 })
   );
 
   await Promise.all(
     messages.map(async message => {
-      let providerEventId: string;
+      let payloadId: string;
       try {
-        validatePayload(message.payload);
-        providerEventId = (message.payload as InboundPayload).providerEventId;
+        payloadId = extractId(message.payload);
       } catch {
         await queueWorkerTransaction(client => adapter.archive(client, options.queue, message.messageId));
         options.logger?.error('Archived malformed queue message', { queue: options.queue, messageId: message.messageId.toString() });
@@ -43,12 +50,12 @@ export async function processWorkerBatch(options: WorkerRuntimeOptions): Promise
       }
 
       try {
-        await options.process(providerEventId);
+        await options.process(payloadId);
         await queueWorkerTransaction(client => adapter.delete(client, options.queue, message.messageId));
       } catch (error) {
         if (error instanceof RetryableWorkError) {
           await queueWorkerTransaction(async client => {
-            await adapter.send(client, options.queue, message.payload as InboundPayload, Math.ceil(error.delayMs / 1_000));
+            await adapter.send(client, options.queue, message.payload as QueuePayload, Math.ceil(error.delayMs / 1_000));
             await adapter.delete(client, options.queue, message.messageId);
           });
           return;

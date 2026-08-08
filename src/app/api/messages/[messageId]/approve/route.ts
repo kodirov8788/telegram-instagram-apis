@@ -2,8 +2,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import { withLiveAuthorization } from '@/lib/auth/session';
 import { query } from '@/lib/db';
 import { errorResponse, HttpError, parseValue, uuid } from '@/lib/http/validation';
-import { AIIntelligenceService } from '@/lib/services/ai-intelligence';
 import { AuditLogService } from '@/lib/services/audit-log';
+import { createJobAndEnqueue, DuplicateActiveJobError } from '@/lib/services/outbound-jobs';
 
 const target = (ctx: { params: Promise<{ messageId: string }> }) => ctx.params.then(p => parseValue(p.messageId, uuid));
 
@@ -77,26 +77,35 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ messageId:
 
     const channelUserIdentifier = claimed.channel === 'telegram' ? claimed.telegram_id : claimed.instagram_id;
 
+    // Job creation (not a synchronous provider call) after the atomic claim
+    // above. The claim UPDATE already prevents concurrent double-approval
+    // (delivery_status='pending_approval'->'approved' only ever succeeds
+    // once); createJobAndEnqueue's DB-level unique-active-job constraint on
+    // message_id is a second, independent guarantee that even if two
+    // requests somehow both reached this point for the same message, only
+    // one outbound_jobs row would ever be created — the loser gets
+    // DuplicateActiveJobError, not a duplicate job.
     try {
-      await AIIntelligenceService.dispatchOutboundMessage(
-        {
-          workspaceId: claimed.workspace_id,
-          channel: claimed.channel,
-          channelUserIdentifier,
-          content: claimed.content,
-          messageType: 'text',
-          rawPayload: null,
-          connectionId: claimed.connection_id ?? undefined,
-        },
-        claimed.content
-      );
-      await query(`UPDATE messages SET delivery_status = 'sent' WHERE id = $1`, [claimed.id]);
+      await createJobAndEnqueue({
+        workspaceId: claimed.workspace_id,
+        connectionId: claimed.connection_id,
+        channel: claimed.channel,
+        messageId: claimed.id,
+        recipientId: String(channelUserIdentifier),
+        content: claimed.content,
+      });
     } catch (error) {
+      if (error instanceof DuplicateActiveJobError) {
+        // Someone else's job already exists for this message; nothing more
+        // to do here — the worker owns marking this message's terminal
+        // delivery_status.
+        return NextResponse.json({ message: { id: claimed.id, conversationId: claimed.conversation_id, deliveryStatus: 'approved' } });
+      }
       await query(`UPDATE messages SET delivery_status = 'failed' WHERE id = $1`, [claimed.id]);
       throw error;
     }
 
-    return NextResponse.json({ message: { id: claimed.id, conversationId: claimed.conversation_id, deliveryStatus: 'sent' } });
+    return NextResponse.json({ message: { id: claimed.id, conversationId: claimed.conversation_id, deliveryStatus: 'approved' } });
   } catch (error) {
     return errorResponse(error);
   }

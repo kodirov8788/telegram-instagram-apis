@@ -7,6 +7,7 @@ import { AuditLogService } from './audit-log';
 import { InboundPersistenceService } from './inbound-persistence';
 import pool, { query } from '../db';
 import { getConnectionSecret } from './connection-secret-loader';
+import { createJobAndEnqueue } from './outbound-jobs';
 
 export class AIIntelligenceService {
   static async processIncomingMessage(msg: UnifiedMessageDTO) {
@@ -148,27 +149,63 @@ export class AIIntelligenceService {
       return;
     }
 
-    // 'auto': insert as 'pending' and only flip to 'sent' after dispatch
-    // actually succeeds — not before. Marking it 'sent' first (the prior
-    // behavior) meant a dispatch failure left a permanently mislabeled row
-    // that claims delivery which never happened, with nothing surfacing the
-    // failure. This also can't be silently retried today (the
-    // provider_event_id dedup at the top of this function short-circuits
-    // before reaching this code on any redelivery of the same inbound
-    // event), so on failure this records 'failed' rather than leaving the
-    // wrong status — automatic redispatch is future work, tracked with the
-    // outbound-jobs queue explicitly deferred in ISSUE-07's PR.
+    // 'auto': insert as 'pending', create an outbound_jobs row, and enqueue
+    // it for the outbound worker (#46) — the provider call itself no longer
+    // happens synchronously here. The worker owns marking the job
+    // sent/failed/ambiguous and, alongside that, updating this message's
+    // delivery_status, so the two stay consistent (see
+    // outbound.ts:updateMessageDeliveryStatus). Deriving workspace_id,
+    // connection_id, and channel fresh from `conversations` (not from
+    // msg.workspaceId/msg.connectionId, which are not trusted for writes —
+    // see the comment at the top of this function) keeps job creation
+    // tenant-safe the same way persist_inbound_message is.
+    const convRow = await query(
+      `SELECT c.workspace_id, c.connection_id, c.channel,
+              COALESCE(cust.telegram_id, cust.instagram_id) AS recipient_id
+       FROM conversations c
+       JOIN customers cust ON cust.id = c.customer_id
+       WHERE c.id = $1`,
+      [conversation.id]
+    );
+    const convInfo = convRow.rows[0];
+    if (!convInfo?.connection_id || !convInfo?.recipient_id) {
+      // No usable connection/recipient to dispatch to — record as failed
+      // rather than silently dropping the AI reply.
+      const aiInsert = await query(
+        `INSERT INTO messages (conversation_id, sender, content, message_type, delivery_status, ai_confidence)
+         VALUES ($1, 'ai', $2, 'text', 'failed', $3)
+         RETURNING id`,
+        [conversation.id, aiReplyText, classification.confidenceScore]
+      );
+      console.error(`No dispatchable connection/recipient for conversation ${conversation.id}; message ${aiInsert.rows[0]?.id} marked failed`);
+      return;
+    }
+
+    // Message insert is a separate small local-DB write from job
+    // creation+enqueue; both are cheap, but only the job creation+enqueue
+    // needs same-transaction atomicity with a pgmq send (see
+    // createJobAndEnqueue's doc comment / PR section 6 for why message
+    // insert isn't folded into that same transaction: `createJob`'s unique
+    // active-job constraint is keyed on message_id, so the message row must
+    // exist and be committed before the job insert can reference it).
     const aiInsert = await query(
       `INSERT INTO messages (conversation_id, sender, content, message_type, delivery_status, ai_confidence)
        VALUES ($1, 'ai', $2, 'text', 'pending', $3)
        RETURNING id`,
       [conversation.id, aiReplyText, classification.confidenceScore]
     );
+    const messageId = aiInsert.rows[0]?.id;
     try {
-      await this.dispatchOutboundMessage(msg, aiReplyText);
-      await query(`UPDATE messages SET delivery_status = 'sent' WHERE id = $1`, [aiInsert.rows[0]?.id]);
+      await createJobAndEnqueue({
+        workspaceId: convInfo.workspace_id,
+        connectionId: convInfo.connection_id,
+        channel: convInfo.channel,
+        messageId,
+        recipientId: String(convInfo.recipient_id),
+        content: aiReplyText,
+      });
     } catch (error) {
-      await query(`UPDATE messages SET delivery_status = 'failed' WHERE id = $1`, [aiInsert.rows[0]?.id]);
+      await query(`UPDATE messages SET delivery_status = 'failed' WHERE id = $1`, [messageId]);
       throw error;
     }
   }
