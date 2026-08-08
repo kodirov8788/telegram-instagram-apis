@@ -14,7 +14,8 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:db": "node scripts/test-db.mjs",
-    "worker": "tsx scripts/worker.ts"
+    "worker": "tsx scripts/worker.ts",
+    "outbound-worker": "tsx scripts/outbound-worker.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.0",

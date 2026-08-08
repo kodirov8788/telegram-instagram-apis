@@ -7,6 +7,7 @@ import { AuditLogService } from './audit-log';
 import { InboundPersistenceService } from './inbound-persistence';
 import pool, { query } from '../db';
 import { getConnectionSecret } from './connection-secret-loader';
+import { createJob, enqueueOutboundJob } from './outbound-jobs';
 
 export class AIIntelligenceService {
   static async processIncomingMessage(msg: UnifiedMessageDTO) {
@@ -148,28 +149,83 @@ export class AIIntelligenceService {
       return;
     }
 
-    // 'auto': insert as 'pending' and only flip to 'sent' after dispatch
-    // actually succeeds — not before. Marking it 'sent' first (the prior
-    // behavior) meant a dispatch failure left a permanently mislabeled row
-    // that claims delivery which never happened, with nothing surfacing the
-    // failure. This also can't be silently retried today (the
-    // provider_event_id dedup at the top of this function short-circuits
-    // before reaching this code on any redelivery of the same inbound
-    // event), so on failure this records 'failed' rather than leaving the
-    // wrong status — automatic redispatch is future work, tracked with the
-    // outbound-jobs queue explicitly deferred in ISSUE-07's PR.
-    const aiInsert = await query(
-      `INSERT INTO messages (conversation_id, sender, content, message_type, delivery_status, ai_confidence)
-       VALUES ($1, 'ai', $2, 'text', 'pending', $3)
-       RETURNING id`,
-      [conversation.id, aiReplyText, classification.confidenceScore]
+    // 'auto': insert as 'pending', create an outbound_jobs row, and enqueue
+    // it for the outbound worker (#46) — the provider call itself no longer
+    // happens synchronously here. The worker owns marking the job
+    // sent/failed/ambiguous and, alongside that, updating this message's
+    // delivery_status, so the two stay consistent (see
+    // outbound.ts:updateMessageDeliveryStatus). Deriving workspace_id,
+    // connection_id, and channel fresh from `conversations` (not from
+    // msg.workspaceId/msg.connectionId, which are not trusted for writes —
+    // see the comment at the top of this function) keeps job creation
+    // tenant-safe the same way persist_inbound_message is.
+    const convRow = await query(
+      `SELECT c.workspace_id, c.connection_id, c.channel,
+              COALESCE(cust.telegram_id, cust.instagram_id) AS recipient_id
+       FROM conversations c
+       JOIN customers cust ON cust.id = c.customer_id
+       WHERE c.id = $1`,
+      [conversation.id]
     );
+    const convInfo = convRow.rows[0];
+    if (!convInfo?.connection_id || !convInfo?.recipient_id) {
+      // No usable connection/recipient to dispatch to — record as failed
+      // rather than silently dropping the AI reply.
+      const aiInsert = await query(
+        `INSERT INTO messages (conversation_id, sender, content, message_type, delivery_status, ai_confidence)
+         VALUES ($1, 'ai', $2, 'text', 'failed', $3)
+         RETURNING id`,
+        [conversation.id, aiReplyText, classification.confidenceScore]
+      );
+      console.error(`No dispatchable connection/recipient for conversation ${conversation.id}; message ${aiInsert.rows[0]?.id} marked failed`);
+      return;
+    }
+
+    // Message insert + job creation + enqueue are one atomic transaction —
+    // a crash between message-persist and job-creation used to leave a
+    // 'pending' message with no outbound_job and nothing to ever notice
+    // (a stranded, silently-undelivered reply). Postgres makes a row
+    // inserted earlier in a transaction visible to later statements in
+    // that same transaction even before COMMIT, so the job insert's FK to
+    // `messages` is satisfiable without needing the message committed
+    // first — the two writes never need to be split.
+    const client = await pool.connect();
+    let messageId: string | undefined;
     try {
-      await this.dispatchOutboundMessage(msg, aiReplyText);
-      await query(`UPDATE messages SET delivery_status = 'sent' WHERE id = $1`, [aiInsert.rows[0]?.id]);
+      await client.query('BEGIN');
+      const aiInsert = await client.query(
+        `INSERT INTO messages (conversation_id, sender, content, message_type, delivery_status, ai_confidence)
+         VALUES ($1, 'ai', $2, 'text', 'pending', $3)
+         RETURNING id`,
+        [conversation.id, aiReplyText, classification.confidenceScore]
+      );
+      messageId = aiInsert.rows[0]?.id;
+      if (!messageId) throw new Error('AI message insert returned no id');
+      const job = await createJob(
+        {
+          workspaceId: convInfo.workspace_id,
+          connectionId: convInfo.connection_id,
+          channel: convInfo.channel,
+          messageId,
+          recipientId: String(convInfo.recipient_id),
+          content: aiReplyText,
+        },
+        client
+      );
+      await enqueueOutboundJob(client, job.id);
+      await client.query('COMMIT');
     } catch (error) {
-      await query(`UPDATE messages SET delivery_status = 'failed' WHERE id = $1`, [aiInsert.rows[0]?.id]);
+      try { await client.query('ROLLBACK'); } catch { /* ignore */ }
+      // DuplicateActiveJobError can't actually occur here (messageId is
+      // freshly generated inside this same transaction, so no prior job
+      // could exist for it) — any error here means the whole transaction
+      // (including the message insert) rolled back, so there is nothing
+      // stranded to mark 'failed'. Rethrow so the caller (the inbound
+      // worker) sees this as a retryable failure of the whole inbound
+      // event, same as any other error at this point in the pipeline.
       throw error;
+    } finally {
+      client.release();
     }
   }
 

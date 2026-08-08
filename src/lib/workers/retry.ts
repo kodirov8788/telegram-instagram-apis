@@ -1,5 +1,8 @@
 export const MAX_DELIVERY_ATTEMPTS = 8;
 
+/** Distinct, smaller attempt budget for outbound provider deliveries (issue #46) — does not replace MAX_DELIVERY_ATTEMPTS. */
+export const MAX_DELIVERY_ATTEMPTS_OUTBOUND = 5;
+
 /** Bounded exponential backoff (capped at 1h) with +/-25% jitter, or an explicit override clamped to [1s, 24h]. */
 export function retryDelayMs(attempt: number, retryAfterMs?: number, random: () => number = Math.random): number {
   if (retryAfterMs !== undefined) {

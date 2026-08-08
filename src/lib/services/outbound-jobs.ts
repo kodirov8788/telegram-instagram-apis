@@ -1,4 +1,7 @@
-import { query } from '../db';
+import pool, { query, DbClient } from '../db';
+import { PgmqQueueAdapter } from '../queue/pgmq-adapter';
+
+const adapter = new PgmqQueueAdapter();
 
 export type OutboundChannel = 'telegram' | 'instagram';
 
@@ -24,6 +27,7 @@ export interface OutboundJob {
   lastError: string | null;
   nextAttemptAt: Date;
   sentAt: Date | null;
+  dispatchedAt: Date | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -80,6 +84,7 @@ function mapRow(row: any): OutboundJob {
     lastError: row.last_error,
     nextAttemptAt: row.next_attempt_at,
     sentAt: row.sent_at,
+    dispatchedAt: row.dispatched_at ?? null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -95,9 +100,10 @@ function mapRow(row: any): OutboundJob {
  * to create one raises `DuplicateActiveJobError` instead of silently
  * succeeding or double-enqueuing a send.
  */
-export async function createJob(input: CreateOutboundJobInput): Promise<OutboundJob> {
+export async function createJob(input: CreateOutboundJobInput, client?: DbClient): Promise<OutboundJob> {
+  const runner = client ?? { query: (text: string, params?: any[]) => query(text, params) };
   try {
-    const result = await query(
+    const result = await runner.query(
       `INSERT INTO outbound_jobs (workspace_id, connection_id, channel, message_id, recipient_id, content)
        VALUES ($1, $2, $3, $4, $5, $6)
        RETURNING *`,
@@ -110,6 +116,71 @@ export async function createJob(input: CreateOutboundJobInput): Promise<Outbound
     }
     throw error;
   }
+}
+
+/**
+ * Creates the job row and publishes `{v:1, outboundJobId}` to the
+ * `outbound_jobs` pgmq queue in a single DB transaction — mirroring
+ * `provider-events.ts`'s `insertProviderEvent`, which does the identical
+ * "ledger insert + ydeck_queue.send in one transaction" pattern for
+ * inbound. pgmq's `send` is itself a table insert under the hood (migration
+ * 010), so it can safely participate in the same local-DB transaction as
+ * the job insert — no network call is made here, so no long-held
+ * transaction risk. Duplicate-active-job protection (the partial unique
+ * index) still applies: a second attempt for the same message rolls the
+ * whole transaction back and raises `DuplicateActiveJobError`, so no
+ * partial "job created but not enqueued" state is possible.
+ */
+export async function createJobAndEnqueue(input: CreateOutboundJobInput): Promise<OutboundJob> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const job = await createJob(input, client);
+    await enqueueOutboundJob(client, job.id);
+    await client.query('COMMIT');
+    return job;
+  } catch (error) {
+    // Covers both createJob's DuplicateActiveJobError (the INSERT's unique
+    // violation) and any enqueue failure — either way nothing should be
+    // left committed.
+    try { await client.query('ROLLBACK'); } catch { /* ignore */ }
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Publishes `{v:1, outboundJobId}` to the `outbound_jobs` pgmq queue using
+ * the given client — exists so callers that need the message-insert +
+ * job-creation + enqueue to be one atomic unit (closing the "message
+ * persisted, no job/enqueue yet" crash window — see ai-intelligence.ts's
+ * auto-mode block and the approve route) can call `createJob(input,
+ * client)` + `enqueueOutboundJob(client, job.id)` directly inside their own
+ * transaction, instead of going through `createJobAndEnqueue`'s
+ * self-contained transaction (which necessarily can't also cover a
+ * caller-owned message write).
+ */
+export async function enqueueOutboundJob(client: DbClient, jobId: string): Promise<void> {
+  await adapter.send(client, 'outbound_jobs', { v: 1, outboundJobId: jobId });
+}
+
+/**
+ * Ambiguous-delivery protection (issue #46): atomically marks a claimed
+ * job as "about to call the provider" immediately before the network call
+ * is made. Returns false if the job was already dispatched (someone else's
+ * attempt got here first, or a reclaim already routed this attempt away
+ * from ever calling the provider) — callers must skip the provider call
+ * when this returns false.
+ */
+export async function markDispatched(jobId: string): Promise<boolean> {
+  const result = await query(
+    `UPDATE outbound_jobs SET dispatched_at = NOW(), updated_at = NOW()
+     WHERE id = $1 AND status = 'processing' AND dispatched_at IS NULL
+     RETURNING id`,
+    [jobId]
+  );
+  return Boolean(result.rows[0]);
 }
 
 /**
@@ -203,5 +274,64 @@ export async function markAmbiguous(jobId: string, error: string): Promise<Outbo
   );
   const row = result.rows[0];
   if (!row) throw new InvalidJobTransitionError(jobId, 'markAmbiguous');
+  return mapRow(row);
+}
+
+/**
+ * Resolves an `ambiguous` job after an explicit decision by whoever
+ * investigated it (an operator, or an automated reconciliation check
+ * against the provider's own delivery records — not built here, this is
+ * just the resolution primitive so `ambiguous` is not a true dead end).
+ *
+ * - 'confirmed_delivered': the provider did receive it — mark the job
+ *   `sent` without re-dispatching, optionally recording the provider's
+ *   message id if the investigation recovered one.
+ * - 'confirmed_not_delivered': the provider never received it — safe to
+ *   retry normally, so this schedules a retry via `next_attempt_at` rather
+ *   than dispatching immediately (respects the same backoff discipline as
+ *   any other retry, doesn't bypass `dispatched_at`'s "already attempted"
+ *   guard by clearing it, which allows the worker to dispatch again).
+ * - 'abandon': give up — terminal, matches `permanent_failed`.
+ *
+ * Rejects the transition from any state other than `ambiguous` — this is
+ * not a way to short-circuit the normal `processing` lifecycle.
+ */
+export type AmbiguousResolution = 'confirmed_delivered' | 'confirmed_not_delivered' | 'abandon';
+
+export async function resolveAmbiguousJob(
+  jobId: string,
+  resolution: AmbiguousResolution,
+  providerMessageId?: string
+): Promise<OutboundJob> {
+  const result = await (async () => {
+    switch (resolution) {
+      case 'confirmed_delivered':
+        return query(
+          `UPDATE outbound_jobs
+           SET status = 'sent', provider_message_id = COALESCE($2, provider_message_id), sent_at = NOW(), updated_at = NOW()
+           WHERE id = $1 AND status = 'ambiguous'
+           RETURNING *`,
+          [jobId, providerMessageId ?? null]
+        );
+      case 'confirmed_not_delivered':
+        return query(
+          `UPDATE outbound_jobs
+           SET status = 'retryable_failed', dispatched_at = NULL, next_attempt_at = NOW(), updated_at = NOW()
+           WHERE id = $1 AND status = 'ambiguous'
+           RETURNING *`,
+          [jobId]
+        );
+      case 'abandon':
+        return query(
+          `UPDATE outbound_jobs
+           SET status = 'permanent_failed', updated_at = NOW()
+           WHERE id = $1 AND status = 'ambiguous'
+           RETURNING *`,
+          [jobId]
+        );
+    }
+  })();
+  const row = result.rows[0];
+  if (!row) throw new InvalidJobTransitionError(jobId, `resolveAmbiguousJob:${resolution}`);
   return mapRow(row);
 }

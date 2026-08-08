@@ -1,5 +1,5 @@
 import type { DbClient } from '../db';
-import { QueueAdapter, QueueName, QueuePayload, QueueMessage, validatePayload } from './contracts';
+import { QueueAdapter, QueueName, QueuePayload, QueueMessage, validatePayload, validateOutboundPayload } from './contracts';
 import { QueueValidationError } from './errors';
 
 interface StoredMessage {
@@ -30,7 +30,14 @@ export class TestQueueAdapter implements QueueAdapter {
   }
 
   async send(_client: DbClient, queue: QueueName, payload: QueuePayload, delaySeconds = 0): Promise<bigint> {
-    validatePayload(payload);
+    if (queue !== 'inbound_events' && queue !== 'outbound_jobs') {
+      throw new QueueValidationError(`Unknown queue: ${queue}`);
+    }
+    if (queue === 'inbound_events') {
+      validatePayload(payload);
+    } else {
+      validateOutboundPayload(payload);
+    }
     if (!Number.isInteger(delaySeconds) || delaySeconds < 0) {
       throw new QueueValidationError('delaySeconds must be an integer >= 0');
     }

@@ -1,29 +1,29 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { withLiveAuthorization } from '@/lib/auth/session';
-import { query } from '@/lib/db';
 import { errorResponse, HttpError, parseValue, uuid } from '@/lib/http/validation';
-import { AIIntelligenceService } from '@/lib/services/ai-intelligence';
 import { AuditLogService } from '@/lib/services/audit-log';
+import { createJob, enqueueOutboundJob, DuplicateActiveJobError } from '@/lib/services/outbound-jobs';
 
 const target = (ctx: { params: Promise<{ messageId: string }> }) => ctx.params.then(p => parseValue(p.messageId, uuid));
 
 // Approves a `pending_approval` AI draft and sends it.
 //
-// Two phases, deliberately not one transaction:
-//   1. Claim: a single atomic UPDATE, tenant-scoped, committed before we
-//      return from withLiveAuthorization. This is simultaneously tenant
-//      isolation, duplicate-approval protection (a second concurrent
-//      approve/reject sees delivery_status already changed and matches 0
-//      rows), and the "mode changed to human while pending" guard.
-//   2. Dispatch: runs AFTER that commit, outside any transaction. Holding a
-//      DB transaction open across the outbound network call would block
-//      other work on this row for the duration of that call; worse, if the
-//      transaction's COMMIT failed after the external send already
-//      succeeded, a rollback would put the message back to
-//      'pending_approval' and let someone approve (and send) it again. By
-//      committing the approval as 'approved' first, dispatch failure just
-//      means a follow-up UPDATE to 'failed' — the approval itself is never
-//      undone or repeatable.
+// Claim + job-creation + enqueue are ONE transaction (withLiveAuthorization's
+// tenantTransaction) — closing the "approved but crashed before a job
+// existed" stranded-message window. This is safe to do in one transaction
+// specifically because none of it makes a network call: the claim UPDATE,
+// the outbound_jobs INSERT, and the pgmq enqueue (itself a local table
+// insert under the hood, see migration 010) are all local DB writes. The
+// actual provider call happens later, inside the outbound worker, outside
+// any transaction here — that's the boundary this route still respects.
+//
+// A SAVEPOINT wraps just the job-creation step: if `createJob` reports
+// DuplicateActiveJobError (an active job already exists for this message —
+// not expected in normal flow since the claim UPDATE only ever succeeds
+// once per message, but defensive), we roll back to the savepoint and keep
+// the already-committed 'approved' claim rather than losing it — the same
+// graceful "someone else's job already exists, nothing more to do here"
+// outcome this route had before, without discarding the approval itself.
 export async function POST(req: NextRequest, ctx: { params: Promise<{ messageId: string }> }) {
   try {
     const messageId = await target(ctx);
@@ -62,6 +62,40 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ messageId:
       }
 
       const row = claim.rows[0];
+      const channelUserIdentifier = row.channel === 'telegram' ? row.telegram_id : row.instagram_id;
+
+      // Same transaction as the claim above (see the module-level comment
+      // for why this is safe: no network call happens in this route). The
+      // claim UPDATE already prevents concurrent double-approval
+      // (delivery_status='pending_approval'->'approved' only ever succeeds
+      // once); the SAVEPOINT here handles the defensive case where
+      // createJob's DB-level unique-active-job constraint still fires,
+      // without losing the approval that already committed in this same
+      // transaction if it does.
+      await client.query('SAVEPOINT job_creation');
+      try {
+        const job = await createJob(
+          {
+            workspaceId: row.workspace_id,
+            connectionId: row.connection_id,
+            channel: row.channel,
+            messageId: row.id,
+            recipientId: String(channelUserIdentifier),
+            content: row.content,
+          },
+          client
+        );
+        await enqueueOutboundJob(client, job.id);
+      } catch (error) {
+        if (error instanceof DuplicateActiveJobError) {
+          // Someone else's job already exists for this message; roll back
+          // just the job-creation attempt, keep the approval.
+          await client.query('ROLLBACK TO SAVEPOINT job_creation');
+        } else {
+          throw error;
+        }
+      }
+
       await AuditLogService.logEvent({
         workspaceId: p.workspaceId,
         actorType: 'user',
@@ -75,28 +109,7 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ messageId:
       return row;
     });
 
-    const channelUserIdentifier = claimed.channel === 'telegram' ? claimed.telegram_id : claimed.instagram_id;
-
-    try {
-      await AIIntelligenceService.dispatchOutboundMessage(
-        {
-          workspaceId: claimed.workspace_id,
-          channel: claimed.channel,
-          channelUserIdentifier,
-          content: claimed.content,
-          messageType: 'text',
-          rawPayload: null,
-          connectionId: claimed.connection_id ?? undefined,
-        },
-        claimed.content
-      );
-      await query(`UPDATE messages SET delivery_status = 'sent' WHERE id = $1`, [claimed.id]);
-    } catch (error) {
-      await query(`UPDATE messages SET delivery_status = 'failed' WHERE id = $1`, [claimed.id]);
-      throw error;
-    }
-
-    return NextResponse.json({ message: { id: claimed.id, conversationId: claimed.conversation_id, deliveryStatus: 'sent' } });
+    return NextResponse.json({ message: { id: claimed.id, conversationId: claimed.conversation_id, deliveryStatus: 'approved' } });
   } catch (error) {
     return errorResponse(error);
   }

@@ -96,3 +96,36 @@ describe('TestQueueAdapter in-memory semantics', () => {
     await expect(adapter.read(dummyClient, 'inbound_events', { visibilityTimeout: 0 })).rejects.toThrow(QueueValidationError);
   });
 });
+
+describe('outbound_jobs queue (issue #46)', () => {
+  const VALID_JOB_ID = 'c78a9cde-1234-4678-90ab-cdef12345679';
+
+  it('rejects an unknown queue name', async () => {
+    const adapter = new TestQueueAdapter();
+    await expect(adapter.send(dummyClient, 'not_a_real_queue' as any, { v: 1, outboundJobId: VALID_JOB_ID })).rejects.toThrow(
+      QueueValidationError
+    );
+  });
+
+  it('rejects an outbound_jobs payload shaped for inbound_events (wrong id key)', async () => {
+    const adapter = new TestQueueAdapter();
+    await expect(adapter.send(dummyClient, 'outbound_jobs', { v: 1, providerEventId: VALID_ID } as any)).rejects.toThrow(
+      QueueValidationError
+    );
+  });
+
+  it('sends, reads, and deletes an outbound_jobs message independently of inbound_events', async () => {
+    const adapter = new TestQueueAdapter();
+    const payload = { v: 1 as const, outboundJobId: VALID_JOB_ID };
+    const id = await adapter.send(dummyClient, 'outbound_jobs', payload);
+
+    // inbound_events read does not see the outbound_jobs message.
+    expect(await adapter.read(dummyClient, 'inbound_events', { limit: 5 })).toHaveLength(0);
+
+    const read = await adapter.read(dummyClient, 'outbound_jobs', { limit: 1 });
+    expect(read).toHaveLength(1);
+    expect(read[0].payload).toEqual(payload);
+
+    expect(await adapter.delete(dummyClient, 'outbound_jobs', id)).toBe(true);
+  });
+});
