@@ -5,6 +5,7 @@ import { TelegramService } from './telegram';
 import { InstagramService } from './instagram';
 import { AuditLogService } from './audit-log';
 import { InboundPersistenceService } from './inbound-persistence';
+import { LeadExtractorService } from './lead-extractor';
 import pool, { query } from '../db';
 import { getConnectionSecret } from './connection-secret-loader';
 import { createJob, enqueueOutboundJob } from './outbound-jobs';
@@ -44,6 +45,26 @@ export class AIIntelligenceService {
     if (persisted.isDuplicateEvent) {
       // Already fully processed this exact provider event; nothing further to do.
       return;
+    }
+
+    // 2b. Issue #33: if classification extracted lead info (name/phone/
+    // product/budget), idempotently upsert a leads row for this customer.
+    // Best-effort — extraction failures must never block message handling.
+    if (classification.extractedLeadInfo) {
+      const { product, budget } = classification.extractedLeadInfo;
+      if (product || budget) {
+        try {
+          await LeadExtractorService.extractAndSaveLead({
+            connectionId: msg.connectionId,
+            customerId: persisted.customerId,
+            conversationId: persisted.conversationId,
+            requestedProductOrService: product,
+            budget,
+          });
+        } catch (err) {
+          console.error('Lead extraction failed (non-fatal):', err);
+        }
+      }
     }
 
     const conversation = {

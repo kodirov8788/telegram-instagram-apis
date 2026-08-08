@@ -7,6 +7,7 @@ const matrix: Record<Permission, string[]> = {
   'conversation:read': [...roles],
   'conversation:update': ['owner', 'admin', 'sales_manager', 'sales_representative', 'support_operator'],
   'leads:export': ['owner', 'admin', 'sales_manager', 'read_only_analyst'],
+  'leads:read': ['owner', 'admin', 'sales_manager', 'sales_representative', 'read_only_analyst'],
   'members:read': ['owner', 'admin'],
   'members:invite': ['owner', 'admin'],
   'members:update': ['owner', 'admin'],
