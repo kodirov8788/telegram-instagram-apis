@@ -135,32 +135,34 @@ export async function createJobAndEnqueue(input: CreateOutboundJobInput): Promis
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    let job: OutboundJob;
-    try {
-      const result = await client.query(
-        `INSERT INTO outbound_jobs (workspace_id, connection_id, channel, message_id, recipient_id, content)
-         VALUES ($1, $2, $3, $4, $5, $6)
-         RETURNING *`,
-        [input.workspaceId, input.connectionId, input.channel, input.messageId, input.recipientId, input.content]
-      );
-      job = mapRow(result.rows[0]);
-    } catch (error: any) {
-      await client.query('ROLLBACK');
-      if (error?.code === UNIQUE_VIOLATION) {
-        throw new DuplicateActiveJobError(input.messageId);
-      }
-      throw error;
-    }
-    await adapter.send(client, 'outbound_jobs', { v: 1, outboundJobId: job.id });
+    const job = await createJob(input, client);
+    await enqueueOutboundJob(client, job.id);
     await client.query('COMMIT');
     return job;
   } catch (error) {
-    // Rollback is a no-op if already rolled back above.
+    // Covers both createJob's DuplicateActiveJobError (the INSERT's unique
+    // violation) and any enqueue failure — either way nothing should be
+    // left committed.
     try { await client.query('ROLLBACK'); } catch { /* ignore */ }
     throw error;
   } finally {
     client.release();
   }
+}
+
+/**
+ * Publishes `{v:1, outboundJobId}` to the `outbound_jobs` pgmq queue using
+ * the given client — exists so callers that need the message-insert +
+ * job-creation + enqueue to be one atomic unit (closing the "message
+ * persisted, no job/enqueue yet" crash window — see ai-intelligence.ts's
+ * auto-mode block and the approve route) can call `createJob(input,
+ * client)` + `enqueueOutboundJob(client, job.id)` directly inside their own
+ * transaction, instead of going through `createJobAndEnqueue`'s
+ * self-contained transaction (which necessarily can't also cover a
+ * caller-owned message write).
+ */
+export async function enqueueOutboundJob(client: DbClient, jobId: string): Promise<void> {
+  await adapter.send(client, 'outbound_jobs', { v: 1, outboundJobId: jobId });
 }
 
 /**

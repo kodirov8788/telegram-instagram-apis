@@ -7,7 +7,7 @@ import { AuditLogService } from './audit-log';
 import { InboundPersistenceService } from './inbound-persistence';
 import pool, { query } from '../db';
 import { getConnectionSecret } from './connection-secret-loader';
-import { createJobAndEnqueue } from './outbound-jobs';
+import { createJob, enqueueOutboundJob } from './outbound-jobs';
 
 export class AIIntelligenceService {
   static async processIncomingMessage(msg: UnifiedMessageDTO) {
@@ -181,32 +181,51 @@ export class AIIntelligenceService {
       return;
     }
 
-    // Message insert is a separate small local-DB write from job
-    // creation+enqueue; both are cheap, but only the job creation+enqueue
-    // needs same-transaction atomicity with a pgmq send (see
-    // createJobAndEnqueue's doc comment / PR section 6 for why message
-    // insert isn't folded into that same transaction: `createJob`'s unique
-    // active-job constraint is keyed on message_id, so the message row must
-    // exist and be committed before the job insert can reference it).
-    const aiInsert = await query(
-      `INSERT INTO messages (conversation_id, sender, content, message_type, delivery_status, ai_confidence)
-       VALUES ($1, 'ai', $2, 'text', 'pending', $3)
-       RETURNING id`,
-      [conversation.id, aiReplyText, classification.confidenceScore]
-    );
-    const messageId = aiInsert.rows[0]?.id;
+    // Message insert + job creation + enqueue are one atomic transaction —
+    // a crash between message-persist and job-creation used to leave a
+    // 'pending' message with no outbound_job and nothing to ever notice
+    // (a stranded, silently-undelivered reply). Postgres makes a row
+    // inserted earlier in a transaction visible to later statements in
+    // that same transaction even before COMMIT, so the job insert's FK to
+    // `messages` is satisfiable without needing the message committed
+    // first — the two writes never need to be split.
+    const client = await pool.connect();
+    let messageId: string | undefined;
     try {
-      await createJobAndEnqueue({
-        workspaceId: convInfo.workspace_id,
-        connectionId: convInfo.connection_id,
-        channel: convInfo.channel,
-        messageId,
-        recipientId: String(convInfo.recipient_id),
-        content: aiReplyText,
-      });
+      await client.query('BEGIN');
+      const aiInsert = await client.query(
+        `INSERT INTO messages (conversation_id, sender, content, message_type, delivery_status, ai_confidence)
+         VALUES ($1, 'ai', $2, 'text', 'pending', $3)
+         RETURNING id`,
+        [conversation.id, aiReplyText, classification.confidenceScore]
+      );
+      messageId = aiInsert.rows[0]?.id;
+      if (!messageId) throw new Error('AI message insert returned no id');
+      const job = await createJob(
+        {
+          workspaceId: convInfo.workspace_id,
+          connectionId: convInfo.connection_id,
+          channel: convInfo.channel,
+          messageId,
+          recipientId: String(convInfo.recipient_id),
+          content: aiReplyText,
+        },
+        client
+      );
+      await enqueueOutboundJob(client, job.id);
+      await client.query('COMMIT');
     } catch (error) {
-      await query(`UPDATE messages SET delivery_status = 'failed' WHERE id = $1`, [messageId]);
+      try { await client.query('ROLLBACK'); } catch { /* ignore */ }
+      // DuplicateActiveJobError can't actually occur here (messageId is
+      // freshly generated inside this same transaction, so no prior job
+      // could exist for it) — any error here means the whole transaction
+      // (including the message insert) rolled back, so there is nothing
+      // stranded to mark 'failed'. Rethrow so the caller (the inbound
+      // worker) sees this as a retryable failure of the whole inbound
+      // event, same as any other error at this point in the pipeline.
       throw error;
+    } finally {
+      client.release();
     }
   }
 
