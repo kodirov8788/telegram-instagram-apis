@@ -15,7 +15,9 @@
     "test": "vitest run",
     "test:db": "node scripts/test-db.mjs",
     "worker": "tsx scripts/worker.ts",
-    "outbound-worker": "tsx scripts/outbound-worker.ts"
+    "outbound-worker": "tsx scripts/outbound-worker.ts",
+    "migrate": "tsx scripts/migrate.ts",
+    "ci-check": "bash scripts/ci-check.sh"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.0",
