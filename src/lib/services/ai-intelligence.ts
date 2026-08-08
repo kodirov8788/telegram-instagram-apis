@@ -9,6 +9,7 @@ import { LeadExtractorService } from './lead-extractor';
 import pool, { query } from '../db';
 import { getConnectionSecret } from './connection-secret-loader';
 import { createJob, enqueueOutboundJob } from './outbound-jobs';
+import { buildGuardedReply, type SupportedLanguage } from './response-guardrails';
 
 export class AIIntelligenceService {
   static async processIncomingMessage(msg: UnifiedMessageDTO) {
@@ -108,19 +109,26 @@ export class AIIntelligenceService {
       classification.language
     );
 
-    const contextText = knowledgeDocs.map(d => `[${d.title}]: ${d.content}`).join('\n\n');
-
-    // 5. Synthesize Response with Prompt Guardrails
-    let aiReplyText = "";
-    if (knowledgeDocs.length > 0) {
-      aiReplyText = `[Knowledge Base Answer]\n${knowledgeDocs[0].content}`;
-    } else {
-      aiReplyText = classification.language === 'ru'
-        ? "К сожалению, у меня нет точной информации по вашему вопросу. Я передам запрос менеджеру."
-        : classification.language === 'en'
-        ? "I apologize, but I don't have exact information regarding your question. I will forward this to our manager."
-        : "Afsuski, bu savol bo'yicha aniq ma'lumotga ega emasman. So'rovingizni menejerga yo'naltiraman.";
-    }
+    // 5. Synthesize Response with Guardrails (issue #31)
+    //
+    // The reply is always derived from the retrieved, already-filtered
+    // (approved/non-expired/language-matched, per #30) knowledge snippets —
+    // never freely generated — so it cannot invent facts not present in
+    // `knowledgeDocs`. `buildGuardedReply` additionally:
+    //   - refuses/deflects restricted topics (medical/legal/financial
+    //     advice) before ever touching the knowledge base;
+    //   - runs a lightweight grounding check on the draft reply (price and
+    //     availability claims must be backed by the retrieved text) and
+    //     falls back to a safe "I don't have that information, let me
+    //     connect you with a person" reply — in the same language as the
+    //     inbound message — whenever retrieval returned nothing relevant or
+    //     the draft fails the grounding check.
+    // This same guarded reply is used for every mode (auto/approval/
+    // suggestion/human-notice) below — approval/suggestion drafts can
+    // surface the same "I don't know" uncertainty but never fabricate
+    // facts, matching the auto-mode safety guarantee.
+    const guarded = buildGuardedReply(msg.content, classification.language as SupportedLanguage, knowledgeDocs);
+    const aiReplyText = guarded.text;
 
     // 6. Route by control mode (ISSUE-11). Re-read mode fresh here rather
     // than trusting the `conversation` object fetched at step 2 — the AI
