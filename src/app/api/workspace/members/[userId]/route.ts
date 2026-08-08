@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { withLiveAuthorization } from '@/lib/auth/session';
 import { roles } from '@/lib/auth/permissions';
 import { errorResponse, HttpError, parseBody, parseValue, uuid } from '@/lib/http/validation';
+import { AuditLogService } from '@/lib/services/audit-log';
 const assignable = roles.filter(r => r !== 'owner');
 const schema = z.object({ role: z.enum(assignable as [typeof assignable[number], ...typeof assignable[number][]]) }).strict();
 const target = (ctx: { params: Promise<{ userId: string }> }) => ctx.params.then(p => parseValue(p.userId, uuid));
@@ -15,7 +16,20 @@ export async function PATCH(req: NextRequest, ctx: { params: Promise<{ userId: s
       const locked = await client.query('SELECT role FROM workspace_members WHERE workspace_id=$1 AND user_id=$2 FOR UPDATE', [p.workspaceId, userId]);
       const targetRole = locked.rows[0]?.role;
       if (!targetRole || targetRole === 'owner' || (targetRole === 'admin' && p.role !== 'owner')) throw new HttpError(404, 'Member not found');
-      return client.query('UPDATE workspace_members SET role=$1 WHERE workspace_id=$2 AND user_id=$3 RETURNING user_id,role', [body.role,p.workspaceId,userId]);
+      const updated = await client.query('UPDATE workspace_members SET role=$1 WHERE workspace_id=$2 AND user_id=$3 RETURNING user_id,role', [body.role,p.workspaceId,userId]);
+      if (updated.rows[0]) {
+        await AuditLogService.logEvent({
+          workspaceId: p.workspaceId,
+          actorType: 'user',
+          actorId: p.userId,
+          action: 'member.role_changed',
+          entityType: 'workspace_member',
+          entityId: userId,
+          previousValue: { role: targetRole },
+          newValue: { role: body.role },
+        });
+      }
+      return updated;
     });
     if (!result.rows[0]) throw new HttpError(404, 'Member not found'); return NextResponse.json({ member: result.rows[0] });
   } catch (error) { return errorResponse(error); }
@@ -28,7 +42,19 @@ export async function DELETE(req: NextRequest, ctx: { params: Promise<{ userId: 
       const locked = await client.query('SELECT role FROM workspace_members WHERE workspace_id=$1 AND user_id=$2 FOR UPDATE', [p.workspaceId, userId]);
       const targetRole = locked.rows[0]?.role;
       if (!targetRole || targetRole === 'owner' || (targetRole === 'admin' && p.role !== 'owner')) throw new HttpError(404, 'Member not found');
-      return client.query('DELETE FROM workspace_members WHERE workspace_id=$1 AND user_id=$2 RETURNING user_id', [p.workspaceId,userId]);
+      const deleted = await client.query('DELETE FROM workspace_members WHERE workspace_id=$1 AND user_id=$2 RETURNING user_id', [p.workspaceId,userId]);
+      if (deleted.rows[0]) {
+        await AuditLogService.logEvent({
+          workspaceId: p.workspaceId,
+          actorType: 'user',
+          actorId: p.userId,
+          action: 'member.removed',
+          entityType: 'workspace_member',
+          entityId: userId,
+          previousValue: { role: targetRole },
+        });
+      }
+      return deleted;
     });
     if (!result.rows[0]) throw new HttpError(404, 'Member not found'); return new Response(null, { status: 204 });
   } catch (error) { return errorResponse(error); }

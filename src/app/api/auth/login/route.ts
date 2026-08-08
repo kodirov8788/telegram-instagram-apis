@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { query } from '@/lib/db';
 import { cookieOptions, createSession, SESSION_COOKIE } from '@/lib/auth/session';
 import { errorResponse, HttpError, parseBody } from '@/lib/http/validation';
+import { AuditLogService } from '@/lib/services/audit-log';
 const schema = z.object({ email: z.string().trim().toLowerCase().email().max(255), password: z.string().min(8).max(128) }).strict();
 export async function POST(req: NextRequest) {
   try {
@@ -12,6 +13,7 @@ export async function POST(req: NextRequest) {
     const user = result.rows[0];
     if (!user?.password_hash || !(await compare(body.password, user.password_hash))) throw new HttpError(401, 'Invalid email or password');
     const session = await createSession(user.id);
+    await AuditLogService.logEvent({ actorType: 'user', actorId: user.id, action: 'auth.login', entityType: 'user', entityId: user.id });
     const res = NextResponse.json({ user: { id: user.id, email: user.email } });
     res.cookies.set(SESSION_COOKIE, session.token, cookieOptions(session.expiresAt));
     return res;

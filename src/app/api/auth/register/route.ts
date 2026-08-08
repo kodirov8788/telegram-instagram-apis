@@ -4,6 +4,7 @@ import { z } from 'zod';
 import pool from '@/lib/db';
 import { cookieOptions, createSession, SESSION_COOKIE } from '@/lib/auth/session';
 import { errorResponse, HttpError, parseBody } from '@/lib/http/validation';
+import { AuditLogService } from '@/lib/services/audit-log';
 const schema = z.object({ email: z.string().trim().toLowerCase().email().max(255), fullName: z.string().trim().min(1).max(255), password: z.string().min(12).max(128) }).strict();
 export async function POST(req: NextRequest) {
   let client;
@@ -13,6 +14,7 @@ export async function POST(req: NextRequest) {
     const result = await client.query('INSERT INTO users (email, full_name, password_hash) VALUES ($1,$2,$3) ON CONFLICT (email) DO NOTHING RETURNING id,email,full_name', [body.email, body.fullName, passwordHash]);
     if (!result.rows[0]) throw new HttpError(409, 'Account already exists');
     const session = await createSession(result.rows[0].id, client);
+    await AuditLogService.logEvent({ actorType: 'user', actorId: result.rows[0].id, action: 'auth.register', entityType: 'user', entityId: result.rows[0].id });
     await client.query('COMMIT');
     const res = NextResponse.json({ user: result.rows[0] }, { status: 201 }); res.cookies.set(SESSION_COOKIE, session.token, cookieOptions(session.expiresAt)); return res;
   } catch (error) { if (client) await client.query('ROLLBACK'); return errorResponse(error); }
