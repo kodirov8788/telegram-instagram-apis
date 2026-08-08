@@ -4,7 +4,8 @@ export type Permission =
   | 'workspace:read' | 'workspace:update'
   | 'conversation:read' | 'conversation:update'
   | 'leads:export' | 'leads:read'
-  | 'members:read' | 'members:invite' | 'members:update' | 'members:remove';
+  | 'members:read' | 'members:invite' | 'members:update' | 'members:remove'
+  | 'knowledge:read' | 'knowledge:write';
 
 const permissions: Record<Permission, readonly Role[]> = {
   'workspace:read': roles,
@@ -17,6 +18,8 @@ const permissions: Record<Permission, readonly Role[]> = {
   'members:invite': ['owner', 'admin'],
   'members:update': ['owner', 'admin'],
   'members:remove': ['owner', 'admin'],
+  'knowledge:read': roles,
+  'knowledge:write': ['owner', 'admin', 'sales_manager', 'support_operator'],
 };
 
 export function can(role: string, permission: Permission): role is Role {
