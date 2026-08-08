@@ -21,10 +21,10 @@ beforeEach(() => {
 const req = (url: string, body: unknown, headers: Record<string, string> = {}) =>
   new NextRequest(url, { method: 'POST', body: JSON.stringify(body), headers });
 
-const withSecretConnection = () =>
-  db.mockResolvedValueOnce({
-    rows: [{ id: 'conn-1', workspace_id: 'ws-1', credentials: { webhookSecret: SECRET } }],
-  } as never);
+const withSecretConnection = () => {
+  db.mockResolvedValueOnce({ rows: [{ id: 'conn-1', workspace_id: 'ws-1' }] } as never);
+  db.mockResolvedValueOnce({ rows: [{ secret: JSON.stringify({ webhookSecret: SECRET }) }] } as never);
+};
 
 describe('Telegram webhook POST (fast-ack + enqueue, secret-token authenticated)', () => {
   it('rejects a request with no connection identifier', async () => {
@@ -77,7 +77,8 @@ describe('Telegram webhook POST (fast-ack + enqueue, secret-token authenticated)
   });
 
   it('rejects when the connection has no secret configured (fails closed, never accepts an unverifiable request)', async () => {
-    db.mockResolvedValueOnce({ rows: [{ id: 'conn-1', workspace_id: 'ws-1', credentials: {} }] } as never);
+    db.mockResolvedValueOnce({ rows: [{ id: 'conn-1', workspace_id: 'ws-1' }] } as never);
+    db.mockResolvedValueOnce({ rows: [{ secret: JSON.stringify({}) }] } as never);
 
     const res = await POST(
       req(

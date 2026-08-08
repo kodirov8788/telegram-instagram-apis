@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { resolveChannelConnection } from '@/lib/services/webhook-connection-resolver';
+import { getConnectionSecret } from '@/lib/services/connection-secret-loader';
 import { insertProviderEvent } from '@/lib/services/provider-events';
 import { secretsMatch } from '@/lib/security/webhook-secret';
 
@@ -34,7 +35,8 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ status: 'ok' });
     }
 
-    const expectedSecret = connection.credentials?.webhookSecret;
+    const secret = await getConnectionSecret(connection.connectionId, connection.workspaceId);
+    const expectedSecret = secret?.webhookSecret;
     const providedSecret = req.headers.get('x-telegram-bot-api-secret-token');
     if (typeof expectedSecret !== 'string' || !secretsMatch(expectedSecret, providedSecret)) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });

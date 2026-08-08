@@ -14,12 +14,12 @@ beforeEach(() => {
 describe('resolveChannelConnection', () => {
   it('resolves an active connection by channel + account identifier', async () => {
     db.mockResolvedValueOnce({
-      rows: [{ id: 'conn-1', workspace_id: 'ws-1', credentials: { pageAccessToken: 'tok-1' } }],
+      rows: [{ id: 'conn-1', workspace_id: 'ws-1' }],
     } as never);
 
     const result = await resolveChannelConnection('instagram', 'ig-account-123');
 
-    expect(result).toEqual({ connectionId: 'conn-1', workspaceId: 'ws-1', credentials: { pageAccessToken: 'tok-1' } });
+    expect(result).toEqual({ connectionId: 'conn-1', workspaceId: 'ws-1' });
     expect(db).toHaveBeenCalledWith(expect.stringContaining('is_active = TRUE'), ['instagram', 'ig-account-123']);
   });
 
@@ -49,13 +49,13 @@ describe('resolveChannelConnection', () => {
     expect(db).toHaveBeenCalledWith(expect.any(String), ['telegram', 'shared-account-identifier']);
   });
 
-  it('defaults credentials to an empty object when the column is null', async () => {
+  it('never returns a credentials field — callers must use the secret loader', async () => {
     db.mockResolvedValueOnce({
-      rows: [{ id: 'conn-2', workspace_id: 'ws-2', credentials: null }],
+      rows: [{ id: 'conn-2', workspace_id: 'ws-2' }],
     } as never);
 
     const result = await resolveChannelConnection('instagram', 'ig-account-456');
 
-    expect(result?.credentials).toEqual({});
+    expect(result).not.toHaveProperty('credentials');
   });
 });
