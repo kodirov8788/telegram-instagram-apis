@@ -7,6 +7,7 @@ import { query } from '@/lib/db';
 import { GET as workspaceGet, POST as workspacePost, PUT as workspacePut } from '../workspace/route';
 import { GET as conversationsGet, PATCH as conversationsPatch } from '../conversations/route';
 import { GET as exportGet } from '../leads/export/route';
+import { GET as leadsGet } from '../leads/route';
 import { POST as invitePost } from '../workspace/invitations/route';
 import { GET as membersGet } from '../workspace/members/route';
 import { PATCH as memberPatch, DELETE as memberDelete } from '../workspace/members/[userId]/route';
@@ -24,6 +25,7 @@ describe('all browser business routes require authentication', () => {
     ['conversations GET', () => conversationsGet(req('https://app.test/api/conversations?workspace_id=11111111-1111-4111-8111-111111111111'))],
     ['conversations PATCH', () => conversationsPatch(req('https://app.test/api/conversations', 'PATCH', { conversationId: '11111111-1111-4111-8111-111111111111', status: 'closed' }))],
     ['lead export GET', () => exportGet(req('https://app.test/api/leads/export?workspace_id=11111111-1111-4111-8111-111111111111'))],
+    ['leads list GET', () => leadsGet(req('https://app.test/api/leads?workspace_id=11111111-1111-4111-8111-111111111111'))],
     ['invitation POST', () => invitePost(req('https://app.test/api/workspace/invitations', 'POST', { email: 'member@test.dev', role: 'support_operator' }))],
     ['members GET', () => membersGet(req('https://app.test/api/workspace/members?workspace_id=11111111-1111-4111-8111-111111111111'))],
     ['member PATCH', () => memberPatch(req('https://app.test/api/workspace/members/x', 'PATCH', { role: 'support_operator' }), { params: Promise.resolve({ userId: '22222222-2222-4222-8222-222222222222' }) })],

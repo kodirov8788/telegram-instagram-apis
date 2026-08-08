@@ -3,7 +3,7 @@ export type Role = typeof roles[number];
 export type Permission =
   | 'workspace:read' | 'workspace:update'
   | 'conversation:read' | 'conversation:update'
-  | 'leads:export'
+  | 'leads:export' | 'leads:read'
   | 'members:read' | 'members:invite' | 'members:update' | 'members:remove';
 
 const permissions: Record<Permission, readonly Role[]> = {
@@ -12,6 +12,7 @@ const permissions: Record<Permission, readonly Role[]> = {
   'conversation:read': roles,
   'conversation:update': ['owner', 'admin', 'sales_manager', 'sales_representative', 'support_operator'],
   'leads:export': ['owner', 'admin', 'sales_manager', 'read_only_analyst'],
+  'leads:read': ['owner', 'admin', 'sales_manager', 'sales_representative', 'read_only_analyst'],
   'members:read': ['owner', 'admin'],
   'members:invite': ['owner', 'admin'],
   'members:update': ['owner', 'admin'],
