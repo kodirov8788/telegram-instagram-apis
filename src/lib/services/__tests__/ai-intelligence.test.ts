@@ -228,6 +228,75 @@ describe('AIIntelligenceService.processIncomingMessage — mode routing', () => 
   });
 });
 
+describe('AIIntelligenceService.processIncomingMessage — issue #31 guardrails', () => {
+  it('auto mode safe failure: empty retrieval never fabricates — sends the safe grounded fallback, not an invented answer', async () => {
+    primeStandardFlow('auto');
+    search.mockResolvedValueOnce([] as never); // nothing relevant retrieved (e.g. expired/unapproved knowledge is simply never returned by #30's filtering)
+    db.mockResolvedValueOnce({ rows: [{ mode: 'auto' }] } as never); // fresh mode re-read
+    db.mockResolvedValueOnce({
+      rows: [{ workspace_id: 'ws-1', connection_id: 'conn-1', channel: 'telegram', recipient_id: 'tg-user-1' }],
+    } as never);
+    db.mockResolvedValueOnce({ rows: [] } as never); // BEGIN
+    db.mockResolvedValueOnce({ rows: [{ id: 'ai-msg-safe-1' }] } as never); // AI message insert
+    db.mockResolvedValueOnce({ rows: [] } as never); // COMMIT
+
+    await AIIntelligenceService.processIncomingMessage(baseMsg);
+
+    const pendingInsert = db.mock.calls.find(c => typeof c[0] === 'string' && c[0].includes("'ai', $2, 'text', 'pending'"));
+    expect(pendingInsert).toBeTruthy();
+    const sentText = pendingInsert![1]![1] as string;
+    expect(sentText).toMatch(/don't have exact information/);
+    expect(sentText).not.toMatch(/\$\d/); // never invents a price
+  });
+
+  it('approval mode: surfaces the same safe "I don\'t know" uncertainty as a draft, never a fabricated answer, and never auto-sends', async () => {
+    primeStandardFlow('approval');
+    search.mockResolvedValueOnce([] as never);
+    db.mockResolvedValueOnce({ rows: [{ mode: 'approval' }] } as never);
+    db.mockResolvedValueOnce({ rows: [{ id: 'draft-safe-1' }] } as never);
+
+    await AIIntelligenceService.processIncomingMessage(baseMsg);
+
+    expect(sendMessage).not.toHaveBeenCalled();
+    const draftInsert = db.mock.calls.find(c => typeof c[0] === 'string' && c[0].includes('WITH existing AS'));
+    expect(draftInsert).toBeTruthy();
+    const draftText = draftInsert![1]![1] as string;
+    expect(draftText).toMatch(/don't have exact information/);
+  });
+
+  it('suggestion mode: grounded-answer draft quotes retrieved knowledge verbatim, never inventing facts', async () => {
+    primeStandardFlow('suggestion');
+    search.mockResolvedValueOnce([{ id: 'kb-1', title: 'Hours', content: 'We are open 9am-6pm daily.' }] as never);
+    db.mockResolvedValueOnce({ rows: [{ mode: 'suggestion' }] } as never);
+    db.mockResolvedValueOnce({ rows: [{ id: 'suggestion-safe-1' }] } as never);
+
+    await AIIntelligenceService.processIncomingMessage(baseMsg);
+
+    const draftInsert = db.mock.calls.find(c => typeof c[0] === 'string' && c[0].includes('WITH existing AS'));
+    const draftText = draftInsert![1]![1] as string;
+    expect(draftText).toContain('We are open 9am-6pm daily.');
+  });
+
+  it('restricted topic: refuses/deflects instead of answering, even in auto mode', async () => {
+    primeStandardFlow('auto');
+    classify.mockResolvedValueOnce({ language: 'en', intent: 'general_inquiry', sentiment: 'neutral', confidenceScore: 0.9 } as never);
+    search.mockResolvedValueOnce([{ id: 'kb-1', title: 'Unrelated', content: 'Some approved knowledge.' }] as never);
+    db.mockResolvedValueOnce({ rows: [{ mode: 'auto' }] } as never);
+    db.mockResolvedValueOnce({
+      rows: [{ workspace_id: 'ws-1', connection_id: 'conn-1', channel: 'telegram', recipient_id: 'tg-user-1' }],
+    } as never);
+    db.mockResolvedValueOnce({ rows: [] } as never); // BEGIN
+    db.mockResolvedValueOnce({ rows: [{ id: 'ai-msg-restricted-1' }] } as never);
+    db.mockResolvedValueOnce({ rows: [] } as never); // COMMIT
+
+    await AIIntelligenceService.processIncomingMessage({ ...baseMsg, content: 'What medication dosage should I take?' });
+
+    const pendingInsert = db.mock.calls.find(c => typeof c[0] === 'string' && c[0].includes("'ai', $2, 'text', 'pending'"));
+    const sentText = pendingInsert![1]![1] as string;
+    expect(sentText).toMatch(/not able to provide medical, legal, or financial advice/);
+  });
+});
+
 describe('AIIntelligenceService.processIncomingMessage — issue #74 idempotent AI generation per provider event', () => {
   it('auto mode: a retry whose message insert conflicts on source_provider_event_id creates no job and commits an empty transaction', async () => {
     primeStandardFlow('auto');
