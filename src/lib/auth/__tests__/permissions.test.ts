@@ -12,6 +12,8 @@ const matrix: Record<Permission, string[]> = {
   'members:invite': ['owner', 'admin'],
   'members:update': ['owner', 'admin'],
   'members:remove': ['owner', 'admin'],
+  'knowledge:read': [...roles],
+  'knowledge:write': ['owner', 'admin', 'sales_manager', 'support_operator'],
 };
 
 describe('PRD role permissions', () => {
