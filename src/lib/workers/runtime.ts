@@ -65,12 +65,14 @@ export async function processWorkerBatch(options: WorkerRuntimeOptions): Promise
           options.logger?.error('Archived queue message after maximum attempts', {
             queue: options.queue,
             messageId: message.messageId.toString(),
+            correlationId: payloadId,
             attempts: message.readCount,
           });
         } else {
           options.logger?.error('Queue message processing failed; leaving for redelivery', {
             queue: options.queue,
             messageId: message.messageId.toString(),
+            correlationId: payloadId,
             attempts: message.readCount,
           });
         }
