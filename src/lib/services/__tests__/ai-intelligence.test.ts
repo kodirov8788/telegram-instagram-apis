@@ -160,10 +160,11 @@ describe('AIIntelligenceService.processIncomingMessage — mode routing', () => 
     expect(sendMessage).not.toHaveBeenCalled();
     expect(sendDirectMessage).not.toHaveBeenCalled();
     expect(createJob).not.toHaveBeenCalled();
-    const draftInsert = db.mock.calls.find(c => typeof c[0] === 'string' && c[0].includes('WITH superseded AS'));
+    const draftInsert = db.mock.calls.find(c => typeof c[0] === 'string' && c[0].includes('WITH existing AS'));
     expect(draftInsert).toBeTruthy();
     expect(draftInsert![0]).toContain("delivery_status = 'stale'");
     expect(draftInsert![0]).toContain("IN ('pending_approval', 'suggested')");
+    expect(draftInsert![0]).toContain('source_provider_event_id');
     expect(audit).toHaveBeenCalledWith(expect.objectContaining({ action: 'message.draft_created', entityId: 'draft-1' }));
   });
 
@@ -224,5 +225,59 @@ describe('AIIntelligenceService.processIncomingMessage — mode routing', () => 
 
     expect(persist).not.toHaveBeenCalled();
     expect(sendMessage).not.toHaveBeenCalled();
+  });
+});
+
+describe('AIIntelligenceService.processIncomingMessage — issue #74 idempotent AI generation per provider event', () => {
+  it('auto mode: a retry whose message insert conflicts on source_provider_event_id creates no job and commits an empty transaction', async () => {
+    primeStandardFlow('auto');
+    db.mockResolvedValueOnce({ rows: [{ mode: 'auto' }] } as never); // fresh mode re-read
+    db.mockResolvedValueOnce({
+      rows: [{ workspace_id: 'ws-1', connection_id: 'conn-1', channel: 'telegram', recipient_id: 'tg-user-1' }],
+    } as never); // conversations JOIN customers lookup
+    db.mockResolvedValueOnce({ rows: [] } as never); // BEGIN
+    db.mockResolvedValueOnce({ rows: [] } as never); // AI message insert — ON CONFLICT DO NOTHING, no row returned
+    db.mockResolvedValueOnce({ rows: [] } as never); // COMMIT
+
+    await AIIntelligenceService.processIncomingMessage({ ...baseMsg, providerEventId: 'evt-retry-1' });
+
+    expect(createJob).not.toHaveBeenCalled();
+    expect(enqueueOutboundJob).not.toHaveBeenCalled();
+    expect(db.mock.calls.some(c => c[0] === 'COMMIT')).toBe(true);
+    const pendingInsert = db.mock.calls.find(c => typeof c[0] === 'string' && c[0].includes("'ai', $2, 'text', 'pending'"));
+    expect(pendingInsert).toBeTruthy();
+    expect(pendingInsert![0]).toContain('ON CONFLICT (source_provider_event_id)');
+  });
+
+  it('approval mode: a retry whose insert conflicts on source_provider_event_id creates no second draft and skips the audit log', async () => {
+    primeStandardFlow('approval');
+    db.mockResolvedValueOnce({ rows: [{ mode: 'approval' }] } as never); // fresh mode re-read
+    db.mockResolvedValueOnce({ rows: [] } as never); // combined supersede+insert — conflict, no row returned
+
+    await AIIntelligenceService.processIncomingMessage({ ...baseMsg, providerEventId: 'evt-retry-2' });
+
+    expect(audit).not.toHaveBeenCalled();
+  });
+
+  it('suggestion mode: a retry whose insert conflicts on source_provider_event_id creates no second suggestion and skips the audit log', async () => {
+    primeStandardFlow('suggestion');
+    db.mockResolvedValueOnce({ rows: [{ mode: 'suggestion' }] } as never); // fresh mode re-read
+    db.mockResolvedValueOnce({ rows: [] } as never); // combined supersede+insert — conflict, no row returned
+
+    await AIIntelligenceService.processIncomingMessage({ ...baseMsg, providerEventId: 'evt-retry-3' });
+
+    expect(audit).not.toHaveBeenCalled();
+  });
+
+  it('no-recipient fallback: a retry whose failed-message insert conflicts on source_provider_event_id does not log a second failure', async () => {
+    primeStandardFlow('auto');
+    db.mockResolvedValueOnce({ rows: [{ mode: 'auto' }] } as never); // fresh mode re-read
+    db.mockResolvedValueOnce({ rows: [{ workspace_id: 'ws-1', connection_id: null, channel: 'telegram', recipient_id: null }] } as never); // no dispatchable connection/recipient
+    db.mockResolvedValueOnce({ rows: [] } as never); // failed-message insert — conflict, no row returned
+
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    await AIIntelligenceService.processIncomingMessage({ ...baseMsg, providerEventId: 'evt-retry-4' });
+    expect(errSpy).not.toHaveBeenCalled();
+    errSpy.mockRestore();
   });
 });

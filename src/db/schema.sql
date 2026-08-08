@@ -125,6 +125,7 @@ CREATE TABLE IF NOT EXISTS messages (
     conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
     workspace_id UUID,
     provider_event_id UUID,
+    source_provider_event_id UUID,
     sender sender_type NOT NULL,
     sender_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
     content TEXT NOT NULL,
