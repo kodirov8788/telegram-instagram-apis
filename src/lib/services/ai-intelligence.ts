@@ -126,24 +126,52 @@ export class AIIntelligenceService {
       // second concurrent processIncomingMessage run on the same
       // conversation can't interleave between them and leave two "live"
       // drafts.
+      //
+      // Issue #74: this insert must also be idempotent per provider event —
+      // a worker retry after a post-commit-but-pre-`processed` crash must
+      // not create a second draft/suggestion for the same original customer
+      // message. `existing` is evaluated once, from the same statement
+      // snapshot as `superseded`/`ins`, so a genuine retry (same
+      // providerEventId, already has a row in `messages` via the unique
+      // index on source_provider_event_id) skips both the supersede and the
+      // insert. Two concurrent attempts for the SAME provider event both
+      // see `existing` empty and both attempt the insert; the partial
+      // unique index plus ON CONFLICT DO NOTHING lets only one succeed —
+      // the loser's harmless no-op supersede is idempotent, and the final
+      // state has exactly one live draft either way.
       const draftStatus = currentMode === 'approval' ? 'pending_approval' : 'suggested';
       const inserted = await query(
-        `WITH superseded AS (
+        `WITH existing AS (
+           SELECT id FROM messages
+           WHERE source_provider_event_id = $5::uuid
+         ),
+         superseded AS (
            UPDATE messages SET delivery_status = 'stale'
            WHERE conversation_id = $1 AND delivery_status IN ('pending_approval', 'suggested')
+             AND $5::uuid IS NOT NULL AND NOT EXISTS (SELECT 1 FROM existing)
          )
-         INSERT INTO messages (conversation_id, sender, content, message_type, delivery_status, ai_confidence)
-         VALUES ($1, 'ai', $2, 'text', $3, $4)
+         INSERT INTO messages (conversation_id, sender, content, message_type, delivery_status, ai_confidence, source_provider_event_id)
+         SELECT $1, 'ai', $2, 'text', $3, $4, $5::uuid
+         WHERE $5::uuid IS NULL OR NOT EXISTS (SELECT 1 FROM existing)
+         ON CONFLICT (source_provider_event_id) WHERE source_provider_event_id IS NOT NULL DO NOTHING
          RETURNING id`,
-        [conversation.id, aiReplyText, draftStatus, classification.confidenceScore]
+        [conversation.id, aiReplyText, draftStatus, classification.confidenceScore, msg.providerEventId ?? null]
       );
+
+      const insertedId = inserted.rows[0]?.id;
+      if (!insertedId) {
+        // Either a genuine duplicate retry for this provider event (already
+        // generated) or lost the race to a concurrent attempt — either way
+        // there is nothing further to do here.
+        return;
+      }
 
       await AuditLogService.logEvent({
         workspaceId: msg.workspaceId,
         actorType: 'ai_agent',
         action: currentMode === 'approval' ? 'message.draft_created' : 'message.suggestion_created',
         entityType: 'message',
-        entityId: inserted.rows[0]?.id,
+        entityId: insertedId,
         newValue: { conversationId: conversation.id, deliveryStatus: draftStatus },
       });
       return;
@@ -170,14 +198,21 @@ export class AIIntelligenceService {
     const convInfo = convRow.rows[0];
     if (!convInfo?.connection_id || !convInfo?.recipient_id) {
       // No usable connection/recipient to dispatch to — record as failed
-      // rather than silently dropping the AI reply.
+      // rather than silently dropping the AI reply. Idempotent per
+      // provider event for the same reason as the approval/suggestion
+      // insert above (issue #74): ON CONFLICT DO NOTHING on
+      // source_provider_event_id means a retry of the same event doesn't
+      // record a second failed message.
       const aiInsert = await query(
-        `INSERT INTO messages (conversation_id, sender, content, message_type, delivery_status, ai_confidence)
-         VALUES ($1, 'ai', $2, 'text', 'failed', $3)
+        `INSERT INTO messages (conversation_id, sender, content, message_type, delivery_status, ai_confidence, source_provider_event_id)
+         VALUES ($1, 'ai', $2, 'text', 'failed', $3, $4::uuid)
+         ON CONFLICT (source_provider_event_id) WHERE source_provider_event_id IS NOT NULL DO NOTHING
          RETURNING id`,
-        [conversation.id, aiReplyText, classification.confidenceScore]
+        [conversation.id, aiReplyText, classification.confidenceScore, msg.providerEventId ?? null]
       );
-      console.error(`No dispatchable connection/recipient for conversation ${conversation.id}; message ${aiInsert.rows[0]?.id} marked failed`);
+      const failedId = aiInsert.rows[0]?.id;
+      if (!failedId) return;
+      console.error(`No dispatchable connection/recipient for conversation ${conversation.id}; message ${failedId} marked failed`);
       return;
     }
 
@@ -189,18 +224,36 @@ export class AIIntelligenceService {
     // that same transaction even before COMMIT, so the job insert's FK to
     // `messages` is satisfiable without needing the message committed
     // first — the two writes never need to be split.
+    //
+    // Issue #74: the message insert is also idempotent per provider event
+    // (ON CONFLICT DO NOTHING on source_provider_event_id, additive within
+    // this same transaction — not a separate step, so it can't reopen the
+    // #46 atomicity gap). A worker retry after this transaction committed
+    // but before provider_events was marked 'processed' re-enters here with
+    // the same providerEventId: the insert conflicts, no id comes back, and
+    // this whole function returns without creating a second message/job/
+    // enqueue. Two workers racing the same provider event both attempt the
+    // insert; the unique index lets only one win, so only one job/enqueue
+    // is ever created.
     const client = await pool.connect();
     let messageId: string | undefined;
     try {
       await client.query('BEGIN');
       const aiInsert = await client.query(
-        `INSERT INTO messages (conversation_id, sender, content, message_type, delivery_status, ai_confidence)
-         VALUES ($1, 'ai', $2, 'text', 'pending', $3)
+        `INSERT INTO messages (conversation_id, sender, content, message_type, delivery_status, ai_confidence, source_provider_event_id)
+         VALUES ($1, 'ai', $2, 'text', 'pending', $3, $4::uuid)
+         ON CONFLICT (source_provider_event_id) WHERE source_provider_event_id IS NOT NULL DO NOTHING
          RETURNING id`,
-        [conversation.id, aiReplyText, classification.confidenceScore]
+        [conversation.id, aiReplyText, classification.confidenceScore, msg.providerEventId ?? null]
       );
       messageId = aiInsert.rows[0]?.id;
-      if (!messageId) throw new Error('AI message insert returned no id');
+      if (!messageId) {
+        // Already generated a response for this provider event (retry) or
+        // lost a concurrent race — commit the empty transaction and stop;
+        // nothing further to do.
+        await client.query('COMMIT');
+        return;
+      }
       const job = await createJob(
         {
           workspaceId: convInfo.workspace_id,
