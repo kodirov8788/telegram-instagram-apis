@@ -274,3 +274,62 @@ export async function markAmbiguous(jobId: string, error: string): Promise<Outbo
   if (!row) throw new InvalidJobTransitionError(jobId, 'markAmbiguous');
   return mapRow(row);
 }
+
+/**
+ * Resolves an `ambiguous` job after an explicit decision by whoever
+ * investigated it (an operator, or an automated reconciliation check
+ * against the provider's own delivery records — not built here, this is
+ * just the resolution primitive so `ambiguous` is not a true dead end).
+ *
+ * - 'confirmed_delivered': the provider did receive it — mark the job
+ *   `sent` without re-dispatching, optionally recording the provider's
+ *   message id if the investigation recovered one.
+ * - 'confirmed_not_delivered': the provider never received it — safe to
+ *   retry normally, so this schedules a retry via `next_attempt_at` rather
+ *   than dispatching immediately (respects the same backoff discipline as
+ *   any other retry, doesn't bypass `dispatched_at`'s "already attempted"
+ *   guard by clearing it, which allows the worker to dispatch again).
+ * - 'abandon': give up — terminal, matches `permanent_failed`.
+ *
+ * Rejects the transition from any state other than `ambiguous` — this is
+ * not a way to short-circuit the normal `processing` lifecycle.
+ */
+export type AmbiguousResolution = 'confirmed_delivered' | 'confirmed_not_delivered' | 'abandon';
+
+export async function resolveAmbiguousJob(
+  jobId: string,
+  resolution: AmbiguousResolution,
+  providerMessageId?: string
+): Promise<OutboundJob> {
+  const result = await (async () => {
+    switch (resolution) {
+      case 'confirmed_delivered':
+        return query(
+          `UPDATE outbound_jobs
+           SET status = 'sent', provider_message_id = COALESCE($2, provider_message_id), sent_at = NOW(), updated_at = NOW()
+           WHERE id = $1 AND status = 'ambiguous'
+           RETURNING *`,
+          [jobId, providerMessageId ?? null]
+        );
+      case 'confirmed_not_delivered':
+        return query(
+          `UPDATE outbound_jobs
+           SET status = 'retryable_failed', dispatched_at = NULL, next_attempt_at = NOW(), updated_at = NOW()
+           WHERE id = $1 AND status = 'ambiguous'
+           RETURNING *`,
+          [jobId]
+        );
+      case 'abandon':
+        return query(
+          `UPDATE outbound_jobs
+           SET status = 'permanent_failed', updated_at = NOW()
+           WHERE id = $1 AND status = 'ambiguous'
+           RETURNING *`,
+          [jobId]
+        );
+    }
+  })();
+  const row = result.rows[0];
+  if (!row) throw new InvalidJobTransitionError(jobId, `resolveAmbiguousJob:${resolution}`);
+  return mapRow(row);
+}
