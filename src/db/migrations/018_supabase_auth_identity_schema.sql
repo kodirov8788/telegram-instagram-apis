@@ -64,6 +64,19 @@ END $$;
 --    itself is idempotent via ON CONFLICT (id) DO UPDATE, so re-running
 --    this migration (or re-firing the trigger for the same auth user) is
 --    always a no-op beyond refreshing email/full_name.
+-- Hardened per independent review (issue #84 PR discussion): this trigger
+-- runs in the SAME transaction as the auth.users write it's reacting to, so
+-- any unhandled exception here would abort the real signup itself. Two
+-- realistic failure modes are caught and neutralized rather than allowed to
+-- propagate:
+--   - NEW.email IS NULL (permitted by Supabase Auth for phone/anonymous
+--     sign-in, even though email/password is the only MVP-scoped method) —
+--     public.users.email is NOT NULL, so skip the sync instead of failing;
+--     the row is simply not created yet, and a later UPDATE with a real
+--     email (e.g. on identity linking) will sync normally.
+--   - unique_violation on public.users.email (e.g. two auth identities
+--     briefly sharing an email during an unconfirmed-signup edge case) —
+--     caught and logged via RAISE WARNING rather than aborting auth.users.
 CREATE OR REPLACE FUNCTION public.sync_auth_user_to_public_users()
 RETURNS TRIGGER
 LANGUAGE plpgsql
@@ -71,15 +84,25 @@ SECURITY DEFINER
 SET search_path = pg_catalog, public
 AS $fn$
 BEGIN
-  INSERT INTO public.users (id, email, full_name)
-  VALUES (
-    NEW.id,
-    NEW.email,
-    COALESCE(NEW.raw_user_meta_data ->> 'full_name', split_part(NEW.email, '@', 1))
-  )
-  ON CONFLICT (id) DO UPDATE
-    SET email = EXCLUDED.email,
-        full_name = COALESCE(EXCLUDED.full_name, public.users.full_name);
+  IF NEW.email IS NULL THEN
+    RETURN NEW;
+  END IF;
+
+  BEGIN
+    INSERT INTO public.users (id, email, full_name)
+    VALUES (
+      NEW.id,
+      NEW.email,
+      COALESCE(NEW.raw_user_meta_data ->> 'full_name', split_part(NEW.email, '@', 1))
+    )
+    ON CONFLICT (id) DO UPDATE
+      SET email = EXCLUDED.email,
+          full_name = COALESCE(EXCLUDED.full_name, public.users.full_name);
+  EXCEPTION
+    WHEN unique_violation THEN
+      RAISE WARNING 'sync_auth_user_to_public_users: unique_violation syncing auth.users id=% email=%, skipping', NEW.id, NEW.email;
+  END;
+
   RETURN NEW;
 END;
 $fn$;
