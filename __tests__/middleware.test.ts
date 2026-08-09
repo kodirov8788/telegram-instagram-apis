@@ -7,7 +7,7 @@ vi.mock('@/lib/supabase/server', () => ({
   createSupabaseServerClient: () => ({ auth: { getUser: supabaseMocks.getUser } }),
 }));
 
-import { middleware } from '../middleware';
+import { middleware } from '../src/middleware';
 
 const originalFetch = global.fetch;
 
