@@ -4,6 +4,7 @@ import { FormEvent, useState } from "react";
 import { Button, Card, CardContent, CardHeader, CardTitle, Input } from "@/components/ui";
 import { ErrorBanner } from "@/components/shell";
 import { ASSIGNABLE_ROLES, type Role } from "./types";
+import { useWorkspace } from "@/lib/workspace/context";
 
 /**
  * Invitations: create-only. `POST /api/workspace/invitations` exists and is
@@ -13,6 +14,7 @@ import { ASSIGNABLE_ROLES, type Role } from "./types";
  * a client-side guess at a shape the API doesn't provide.
  */
 export function InvitationsSection() {
+  const { apiFetch } = useWorkspace();
   const [email, setEmail] = useState("");
   const [role, setRole] = useState<Role>("sales_representative");
   const [submitting, setSubmitting] = useState(false);
@@ -25,7 +27,7 @@ export function InvitationsSection() {
     setError(null);
     setLastInvited(null);
     try {
-      const res = await fetch("/api/workspace/invitations", {
+      const res = await apiFetch("/api/workspace/invitations", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email, role }),

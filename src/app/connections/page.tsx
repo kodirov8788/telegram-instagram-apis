@@ -6,6 +6,7 @@ import { AppShell, EmptyState, ErrorBanner, ErrorState, SkeletonList } from "@/c
 import { Badge, Button, Card, CardContent, CardHeader, CardTitle } from "@/components/ui";
 import { ConfigureConnectionDialog } from "./ConfigureConnectionDialog";
 import type { Connection, TestResult } from "./types";
+import { useWorkspace } from "@/lib/workspace/context";
 
 function formatDate(value: string | null) {
   if (!value) return "Never";
@@ -22,6 +23,18 @@ const channelMeta: Record<Connection["channel"], { label: string; icon: typeof I
 };
 
 export default function ConnectionsPage() {
+  // useWorkspace() must be called from a descendant of the WorkspaceProvider
+  // AppShell mounts — this page renders AppShell itself, so the actual body
+  // lives in ConnectionsPageInner, rendered as AppShell's child.
+  return (
+    <AppShell>
+      <ConnectionsPageInner />
+    </AppShell>
+  );
+}
+
+function ConnectionsPageInner() {
+  const { apiFetch, activeWorkspace, loading: workspaceLoading, error: workspaceError } = useWorkspace();
   const [connections, setConnections] = useState<Connection[] | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -31,10 +44,11 @@ export default function ConnectionsPage() {
   const [testState, setTestState] = useState<Record<string, { pending: boolean; result?: TestResult; error?: string }>>({});
 
   async function loadConnections() {
+    if (!activeWorkspace) return;
     setLoading(true);
     setLoadError(null);
     try {
-      const res = await fetch("/api/connections");
+      const res = await apiFetch("/api/connections");
       if (!res.ok) {
         const payload = await res.json().catch(() => null);
         setLoadError(payload?.error ?? `Failed to load connections (${res.status})`);
@@ -50,15 +64,16 @@ export default function ConnectionsPage() {
   }
 
   useEffect(() => {
-    loadConnections();
+    if (activeWorkspace) loadConnections();
     // Intentionally no interval/polling here — connection health is only
     // ever refreshed by an explicit user action (manual reload or Test).
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeWorkspace, apiFetch]);
 
   async function handleTest(connection: Connection) {
     setTestState((prev) => ({ ...prev, [connection.id]: { pending: true } }));
     try {
-      const res = await fetch(`/api/connections/${connection.id}/test`, { method: "POST" });
+      const res = await apiFetch(`/api/connections/${connection.id}/test`, { method: "POST" });
       if (!res.ok) {
         const payload = await res.json().catch(() => null);
         setTestState((prev) => ({
@@ -78,8 +93,26 @@ export default function ConnectionsPage() {
     setConnections((prev) => (prev ? prev.map((c) => (c.id === updated.id ? updated : c)) : prev));
   }
 
+  if (workspaceLoading) {
+    return <SkeletonList rows={3} />;
+  }
+
+  if (workspaceError) {
+    return <ErrorState message={workspaceError} />;
+  }
+
+  if (!activeWorkspace) {
+    return (
+      <EmptyState
+        icon={Plug}
+        title="No workspace selected"
+        message="Select a workspace to manage its connections."
+      />
+    );
+  }
+
   return (
-    <AppShell>
+    <>
       <div className="flex flex-col gap-6">
         <div className="flex items-center justify-between">
           <div>
@@ -183,6 +216,6 @@ export default function ConnectionsPage() {
           onSaved={handleSaved}
         />
       )}
-    </AppShell>
+    </>
   );
 }

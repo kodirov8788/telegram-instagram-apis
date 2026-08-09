@@ -3,6 +3,7 @@
 import { FormEvent, useState } from "react";
 import { Button, Dialog, DialogFooter, Input } from "@/components/ui";
 import type { Connection } from "./types";
+import { useWorkspace } from "@/lib/workspace/context";
 
 export interface ConfigureConnectionDialogProps {
   connection: Connection;
@@ -26,6 +27,7 @@ export function ConfigureConnectionDialog({
   onClose,
   onSaved,
 }: ConfigureConnectionDialogProps) {
+  const { apiFetch } = useWorkspace();
   const [accountIdentifier, setAccountIdentifier] = useState(connection.account_identifier);
   const [isActive, setIsActive] = useState(connection.is_active);
   const [credentialInput, setCredentialInput] = useState("");
@@ -47,7 +49,7 @@ export function ConfigureConnectionDialog({
         body.credential = { [credentialFieldName]: credentialInput.trim() };
       }
 
-      const res = await fetch(`/api/connections/${connection.id}`, {
+      const res = await apiFetch(`/api/connections/${connection.id}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),

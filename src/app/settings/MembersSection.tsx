@@ -17,6 +17,7 @@ import {
 } from "@/components/ui";
 import { ErrorBanner, SkeletonList } from "@/components/shell";
 import { ASSIGNABLE_ROLES, type Member, type Role } from "./types";
+import { useWorkspace } from "@/lib/workspace/context";
 
 /**
  * Team/members list with role management. The API is the source of truth
@@ -25,6 +26,7 @@ import { ASSIGNABLE_ROLES, type Member, type Role } from "./types";
  * viewer's own role to hide actions client-side.
  */
 export function MembersSection() {
+  const { apiFetch } = useWorkspace();
   const [members, setMembers] = useState<Member[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -35,7 +37,7 @@ export function MembersSection() {
     setLoading(true);
     setLoadError(null);
     try {
-      const res = await fetch("/api/workspace/members");
+      const res = await apiFetch("/api/workspace/members");
       if (!res.ok) {
         const payload = await res.json().catch(() => null);
         setLoadError(payload?.error ?? `Failed to load members (${res.status})`);
@@ -52,13 +54,14 @@ export function MembersSection() {
 
   useEffect(() => {
     loadMembers();
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [apiFetch]);
 
   async function handleRoleChange(userId: string, role: Role) {
     setRowPending((prev) => ({ ...prev, [userId]: true }));
     setRowErrors((prev) => ({ ...prev, [userId]: "" }));
     try {
-      const res = await fetch(`/api/workspace/members/${userId}`, {
+      const res = await apiFetch(`/api/workspace/members/${userId}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ role }),
@@ -87,7 +90,7 @@ export function MembersSection() {
     setRowPending((prev) => ({ ...prev, [userId]: true }));
     setRowErrors((prev) => ({ ...prev, [userId]: "" }));
     try {
-      const res = await fetch(`/api/workspace/members/${userId}`, { method: "DELETE" });
+      const res = await apiFetch(`/api/workspace/members/${userId}`, { method: "DELETE" });
       if (!res.ok && res.status !== 204) {
         const payload = await res.json().catch(() => null);
         const message =

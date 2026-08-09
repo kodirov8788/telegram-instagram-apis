@@ -5,11 +5,13 @@ import { Button, Card, CardContent, CardHeader, CardTitle, Input } from "@/compo
 import { ErrorBanner } from "@/components/shell";
 import { SkeletonText } from "@/components/shell";
 import type { Workspace } from "./types";
+import { useWorkspace } from "@/lib/workspace/context";
 
 /**
  * Workspace profile: name / industry / timezone via GET+PUT /api/workspace.
  */
 export function WorkspaceProfileSection() {
+  const { apiFetch } = useWorkspace();
   const [workspace, setWorkspace] = useState<Workspace | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -26,7 +28,7 @@ export function WorkspaceProfileSection() {
       setLoading(true);
       setLoadError(null);
       try {
-        const res = await fetch("/api/workspace");
+        const res = await apiFetch("/api/workspace");
         if (!res.ok) {
           const payload = await res.json().catch(() => null);
           setLoadError(payload?.error ?? `Failed to load workspace (${res.status})`);
@@ -44,7 +46,7 @@ export function WorkspaceProfileSection() {
         setLoading(false);
       }
     })();
-  }, []);
+  }, [apiFetch]);
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
@@ -52,7 +54,7 @@ export function WorkspaceProfileSection() {
     setSaveError(null);
     setSaved(false);
     try {
-      const res = await fetch("/api/workspace", {
+      const res = await apiFetch("/api/workspace", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name, industry, timeZone }),
