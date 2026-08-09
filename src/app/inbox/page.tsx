@@ -1,264 +1,832 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
-import { MessageSquare, Bot, UserCheck, ShieldAlert, Filter, Send, RefreshCw, User, Tag, Sparkles } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import {
+  Bot,
+  Inbox as InboxIcon,
+  MessageSquare,
+  RefreshCw,
+  Search,
+  Send,
+  ShieldAlert,
+  User,
+} from 'lucide-react';
+import { AppShell, EmptyState, ErrorState, Skeleton, SkeletonList } from '@/components/shell';
+import { Badge, Button, Input, type BadgeTone } from '@/components/ui';
+import { cn } from '@/lib/utils';
 
-interface Conversation {
+// ---------------------------------------------------------------------------
+// Types — mirror the shapes returned by /api/conversations, /api/conversations/:id
+// and /api/messages (see route files for the exact SQL projections).
+// ---------------------------------------------------------------------------
+
+type ChannelType = 'telegram' | 'instagram';
+type ControlMode = 'auto' | 'approval' | 'suggestion' | 'human';
+type ConversationStatus =
+  | 'new'
+  | 'ai_handling'
+  | 'waiting_for_customer'
+  | 'human_attention_required'
+  | 'human_handling'
+  | 'qualified_lead'
+  | 'resolved'
+  | 'closed'
+  | 'spam';
+
+interface ConversationListItem {
   id: string;
-  full_name: string;
-  channel: 'telegram' | 'instagram';
-  status: string;
-  mode: 'auto' | 'approval' | 'suggestion' | 'human';
-  detected_language: string;
-  detected_intent: string;
-  lead_score: number;
-  last_message: string;
+  workspace_id: string;
+  customer_id: string;
+  channel: ChannelType;
+  status: ConversationStatus;
+  mode: ControlMode;
+  full_name: string | null;
+  telegram_username: string | null;
+  instagram_username: string | null;
+  unread_count: number;
+  last_message: string | null;
   last_message_at: string;
 }
 
-export default function InboxPage() {
-  const [conversations, setConversations] = useState<Conversation[]>([]);
-  const [selectedConv, setSelectedConv] = useState<Conversation | null>(null);
-  const [activeFilter, setActiveFilter] = useState<string>('all');
-  const [messageInput, setMessageInput] = useState<string>('');
+interface ConversationDetail extends ConversationListItem {
+  phone_number: string | null;
+  email: string | null;
+  detected_language: string | null;
+  detected_intent: string | null;
+  sentiment: string | null;
+  lead_score: number | null;
+}
 
-  useEffect(() => {
-    // Mock initial demo data if database is empty for visual demonstration
-    const mockData: Conversation[] = [
-      {
-        id: '1',
-        full_name: 'Anvar Karimov',
-        channel: 'telegram',
-        status: 'human_attention_required',
-        mode: 'human',
-        detected_language: 'uz',
-        detected_intent: 'refund_request',
-        lead_score: 85,
-        last_message: 'Manga pulimni qaytarib beringlar, mahsulot yoqmasdi.',
-        last_message_at: '01:45',
-      },
-      {
-        id: '2',
-        full_name: 'Elena Smirnova',
-        channel: 'instagram',
-        status: 'ai_handling',
-        mode: 'auto',
-        detected_language: 'ru',
-        detected_intent: 'price_inquiry',
-        lead_score: 90,
-        last_message: 'Здравствуйте! Сколько стоит доставка в Ташкент?',
-        last_message_at: '01:42',
-      },
-      {
-        id: '3',
-        full_name: 'John Doe',
-        channel: 'telegram',
-        status: 'qualified_lead',
-        mode: 'auto',
-        detected_language: 'en',
-        detected_intent: 'product_inquiry',
-        lead_score: 95,
-        last_message: 'I want to purchase 5 units of your premium software tier.',
-        last_message_at: '01:30',
-      },
-    ];
-    setConversations(mockData);
-    setSelectedConv(mockData[0]);
+interface MessageRow {
+  id: string;
+  conversation_id: string;
+  sender: 'customer' | 'ai' | 'human_operator' | 'system';
+  sender_user_id: string | null;
+  content: string;
+  message_type: string;
+  attachment_url: string | null;
+  delivery_status: string;
+  ai_confidence: number | null;
+  created_at: string;
+}
+
+interface LeadRow {
+  id: string;
+  conversation_id: string | null;
+  status: string;
+}
+
+const CHANNEL_TONE: Record<ChannelType, BadgeTone> = {
+  telegram: 'brand',
+  instagram: 'instagram',
+};
+
+const MODE_TONE: Record<ControlMode, BadgeTone> = {
+  auto: 'success',
+  approval: 'warning',
+  suggestion: 'secondary',
+  human: 'error',
+};
+
+const MODE_LABEL: Record<ControlMode, string> = {
+  auto: 'AI Auto',
+  approval: 'Approval',
+  suggestion: 'Suggestion',
+  human: 'Human',
+};
+
+const STATUS_LABEL: Record<ConversationStatus, string> = {
+  new: 'New',
+  ai_handling: 'AI Handling',
+  waiting_for_customer: 'Waiting on Customer',
+  human_attention_required: 'Needs Attention',
+  human_handling: 'Human Handling',
+  qualified_lead: 'Qualified Lead',
+  resolved: 'Resolved',
+  closed: 'Closed',
+  spam: 'Spam',
+};
+
+async function readJson(res: Response) {
+  const text = await res.text();
+  try {
+    return text ? JSON.parse(text) : {};
+  } catch {
+    return {};
+  }
+}
+
+export default function InboxPage() {
+  // Conversation list state
+  const [conversations, setConversations] = useState<ConversationListItem[]>([]);
+  const [listLoading, setListLoading] = useState(true);
+  const [listError, setListError] = useState<string | null>(null);
+
+  // Filters (client-side, per issue scope)
+  const [search, setSearch] = useState('');
+  const [statusFilter, setStatusFilter] = useState<'all' | ConversationStatus>('all');
+  const [channelFilter, setChannelFilter] = useState<'all' | ChannelType>('all');
+
+  // Selected conversation / thread state
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [detail, setDetail] = useState<ConversationDetail | null>(null);
+  const [messages, setMessages] = useState<MessageRow[]>([]);
+  const [pendingDrafts, setPendingDrafts] = useState<MessageRow[]>([]);
+  const [threadLoading, setThreadLoading] = useState(false);
+  const [threadError, setThreadError] = useState<string | null>(null);
+
+  // Composer state
+  const [replyText, setReplyText] = useState('');
+  const [sending, setSending] = useState(false);
+  const [sendError, setSendError] = useState<string | null>(null);
+
+  // Mode toggle state
+  const [modeUpdating, setModeUpdating] = useState(false);
+
+  // Approve/reject state
+  const [actingMessageId, setActingMessageId] = useState<string | null>(null);
+
+  // Lead context
+  const [lead, setLead] = useState<LeadRow | null>(null);
+
+  const fetchConversations = useCallback(async () => {
+    setListLoading(true);
+    setListError(null);
+    try {
+      const res = await fetch('/api/conversations', { credentials: 'same-origin' });
+      const body = await readJson(res);
+      if (!res.ok) throw new Error(body?.error || `Failed to load conversations (${res.status})`);
+      setConversations(body.conversations ?? []);
+    } catch (err) {
+      setListError(err instanceof Error ? err.message : 'Failed to load conversations.');
+    } finally {
+      setListLoading(false);
+    }
   }, []);
 
-  const handleModeToggle = (newMode: 'auto' | 'human') => {
-    if (!selectedConv) return;
-    const updated = { ...selectedConv, mode: newMode, status: newMode === 'human' ? 'human_handling' : 'ai_handling' };
-    setSelectedConv(updated);
-    setConversations(prev => prev.map(c => c.id === updated.id ? updated : c));
+  useEffect(() => {
+    fetchConversations();
+  }, [fetchConversations]);
+
+  const fetchThread = useCallback(async (conversationId: string) => {
+    setThreadLoading(true);
+    setThreadError(null);
+    try {
+      const [convRes, draftsRes] = await Promise.all([
+        fetch(`/api/conversations/${conversationId}`, { credentials: 'same-origin' }),
+        fetch(`/api/messages?conversationId=${conversationId}`, { credentials: 'same-origin' }),
+      ]);
+      const convBody = await readJson(convRes);
+      if (!convRes.ok) throw new Error(convBody?.error || `Failed to load conversation (${convRes.status})`);
+      const draftsBody = await readJson(draftsRes);
+      if (!draftsRes.ok) throw new Error(draftsBody?.error || `Failed to load drafts (${draftsRes.status})`);
+
+      setDetail(convBody.conversation);
+      setMessages(convBody.messages ?? []);
+      setPendingDrafts(draftsBody.messages ?? []);
+    } catch (err) {
+      setThreadError(err instanceof Error ? err.message : 'Failed to load conversation.');
+      setDetail(null);
+      setMessages([]);
+      setPendingDrafts([]);
+    } finally {
+      setThreadLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!selectedId) {
+      setDetail(null);
+      setMessages([]);
+      setPendingDrafts([]);
+      setLead(null);
+      return;
+    }
+    fetchThread(selectedId);
+  }, [selectedId, fetchThread]);
+
+  // Best-effort linked-lead lookup: /api/leads has no conversation_id filter
+  // param, so fetch the workspace's leads and match client-side. Falls back
+  // silently (context panel just omits the lead link) if this fails.
+  useEffect(() => {
+    if (!selectedId) return;
+    let cancelled = false;
+    fetch('/api/leads', { credentials: 'same-origin' })
+      .then(readJson)
+      .then((body) => {
+        if (cancelled) return;
+        const match = (body.leads ?? []).find((l: LeadRow) => l.conversation_id === selectedId);
+        setLead(match ?? null);
+      })
+      .catch(() => {
+        if (!cancelled) setLead(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedId]);
+
+  const filteredConversations = useMemo(() => {
+    return conversations.filter((c) => {
+      if (statusFilter !== 'all' && c.status !== statusFilter) return false;
+      if (channelFilter !== 'all' && c.channel !== channelFilter) return false;
+      if (search.trim()) {
+        const q = search.trim().toLowerCase();
+        const haystack = `${c.full_name ?? ''} ${c.telegram_username ?? ''} ${c.instagram_username ?? ''} ${c.last_message ?? ''}`.toLowerCase();
+        if (!haystack.includes(q)) return false;
+      }
+      return true;
+    });
+  }, [conversations, statusFilter, channelFilter, search]);
+
+  const handleSelectConversation = (id: string) => {
+    setSelectedId(id);
+    setReplyText('');
+    setSendError(null);
   };
 
-  const filteredConversations = conversations.filter(c => {
-    if (activeFilter === 'attention') return c.status === 'human_attention_required';
-    if (activeFilter === 'telegram') return c.channel === 'telegram';
-    if (activeFilter === 'instagram') return c.channel === 'instagram';
-    return true;
-  });
+  const handleModeChange = async (mode: ControlMode) => {
+    if (!detail || modeUpdating) return;
+    setModeUpdating(true);
+    try {
+      const res = await fetch('/api/conversations', {
+        method: 'PATCH',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ conversationId: detail.id, mode }),
+      });
+      const body = await readJson(res);
+      if (!res.ok) throw new Error(body?.error || `Failed to update mode (${res.status})`);
+      setDetail((prev) => (prev ? { ...prev, mode: body.conversation.mode, status: body.conversation.status } : prev));
+      setConversations((prev) =>
+        prev.map((c) => (c.id === detail.id ? { ...c, mode: body.conversation.mode, status: body.conversation.status } : c))
+      );
+    } catch (err) {
+      setThreadError(err instanceof Error ? err.message : 'Failed to update mode.');
+    } finally {
+      setModeUpdating(false);
+    }
+  };
+
+  const handleSendReply = async () => {
+    if (!detail || !replyText.trim() || sending) return;
+    setSending(true);
+    setSendError(null);
+    try {
+      const res = await fetch('/api/messages', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ conversationId: detail.id, content: replyText.trim() }),
+      });
+      const body = await readJson(res);
+      if (!res.ok) throw new Error(body?.error || `Failed to send message (${res.status})`);
+      setReplyText('');
+      await fetchThread(detail.id);
+      await fetchConversations();
+    } catch (err) {
+      setSendError(err instanceof Error ? err.message : 'Failed to send message.');
+    } finally {
+      setSending(false);
+    }
+  };
+
+  const handleApprove = async (messageId: string) => {
+    if (actingMessageId) return;
+    setActingMessageId(messageId);
+    try {
+      const res = await fetch(`/api/messages/${messageId}/approve`, {
+        method: 'POST',
+        credentials: 'same-origin',
+      });
+      const body = await readJson(res);
+      if (!res.ok) throw new Error(body?.error || `Failed to approve (${res.status})`);
+      if (detail) await fetchThread(detail.id);
+    } catch (err) {
+      setThreadError(err instanceof Error ? err.message : 'Failed to approve message.');
+    } finally {
+      setActingMessageId(null);
+    }
+  };
+
+  const handleReject = async (messageId: string) => {
+    if (actingMessageId) return;
+    setActingMessageId(messageId);
+    try {
+      const res = await fetch(`/api/messages/${messageId}/reject`, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      const body = await readJson(res);
+      if (!res.ok) throw new Error(body?.error || `Failed to reject (${res.status})`);
+      if (detail) await fetchThread(detail.id);
+    } catch (err) {
+      setThreadError(err instanceof Error ? err.message : 'Failed to reject message.');
+    } finally {
+      setActingMessageId(null);
+    }
+  };
 
   return (
-    <div className="flex h-screen bg-slate-950 text-slate-100 font-sans overflow-hidden">
-      {/* Sidebar Navigation */}
-      <aside className="w-64 border-r border-slate-800 bg-slate-900/50 p-4 flex flex-col justify-between">
-        <div>
-          <div className="flex items-center gap-2 mb-8 px-2">
-            <div className="w-9 h-9 rounded-lg bg-sky-500 flex items-center justify-center font-bold text-white shadow-lg shadow-sky-500/30">
-              Y
-            </div>
-            <div>
-              <h1 className="font-bold text-base leading-none">YDeck Operator</h1>
-              <span className="text-xs text-sky-400 font-medium">AI Omni-Agent v1.0</span>
+    <AppShell className="p-0 sm:p-0">
+      <div className="flex h-full min-h-0 w-full">
+        <ConversationListPanel
+          conversations={filteredConversations}
+          loading={listLoading}
+          error={listError}
+          onRetry={fetchConversations}
+          onRefresh={fetchConversations}
+          selectedId={selectedId}
+          onSelect={handleSelectConversation}
+          search={search}
+          onSearchChange={setSearch}
+          statusFilter={statusFilter}
+          onStatusFilterChange={setStatusFilter}
+          channelFilter={channelFilter}
+          onChannelFilterChange={setChannelFilter}
+        />
+
+        <ThreadPanel
+          selectedId={selectedId}
+          detail={detail}
+          messages={messages}
+          pendingDrafts={pendingDrafts}
+          loading={threadLoading}
+          error={threadError}
+          onRetry={() => selectedId && fetchThread(selectedId)}
+          onModeChange={handleModeChange}
+          modeUpdating={modeUpdating}
+          replyText={replyText}
+          onReplyTextChange={setReplyText}
+          onSendReply={handleSendReply}
+          sending={sending}
+          sendError={sendError}
+          onApprove={handleApprove}
+          onReject={handleReject}
+          actingMessageId={actingMessageId}
+        />
+
+        <ContextPanel detail={detail} lead={lead} />
+      </div>
+    </AppShell>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Left column — conversation list
+// ---------------------------------------------------------------------------
+
+function ConversationListPanel(props: {
+  conversations: ConversationListItem[];
+  loading: boolean;
+  error: string | null;
+  onRetry: () => void;
+  onRefresh: () => void;
+  selectedId: string | null;
+  onSelect: (id: string) => void;
+  search: string;
+  onSearchChange: (v: string) => void;
+  statusFilter: 'all' | ConversationStatus;
+  onStatusFilterChange: (v: 'all' | ConversationStatus) => void;
+  channelFilter: 'all' | ChannelType;
+  onChannelFilterChange: (v: 'all' | ChannelType) => void;
+}) {
+  const {
+    conversations,
+    loading,
+    error,
+    onRetry,
+    onRefresh,
+    selectedId,
+    onSelect,
+    search,
+    onSearchChange,
+    statusFilter,
+    onStatusFilterChange,
+    channelFilter,
+    onChannelFilterChange,
+  } = props;
+
+  return (
+    <section className="flex w-full max-w-sm shrink-0 flex-col border-r border-border bg-background-subtle">
+      <div className="flex items-center justify-between border-b border-border px-4 py-3">
+        <h2 className="text-base font-semibold text-foreground">Inbox</h2>
+        <Button variant="ghost" size="sm" onClick={onRefresh} aria-label="Refresh conversations">
+          <RefreshCw className="h-4 w-4" />
+        </Button>
+      </div>
+
+      <div className="space-y-2 border-b border-border px-4 py-3">
+        <div className="relative">
+          <Search className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-foreground-subtle" />
+          <Input
+            placeholder="Search conversations..."
+            value={search}
+            onChange={(e) => onSearchChange(e.target.value)}
+            className="pl-8"
+          />
+        </div>
+        <div className="flex flex-wrap gap-1.5">
+          <FilterPill active={channelFilter === 'all'} onClick={() => onChannelFilterChange('all')}>
+            All channels
+          </FilterPill>
+          <FilterPill active={channelFilter === 'telegram'} onClick={() => onChannelFilterChange('telegram')}>
+            Telegram
+          </FilterPill>
+          <FilterPill active={channelFilter === 'instagram'} onClick={() => onChannelFilterChange('instagram')}>
+            Instagram
+          </FilterPill>
+        </div>
+        <div className="flex flex-wrap gap-1.5">
+          <FilterPill active={statusFilter === 'all'} onClick={() => onStatusFilterChange('all')}>
+            All statuses
+          </FilterPill>
+          <FilterPill
+            active={statusFilter === 'human_attention_required'}
+            onClick={() => onStatusFilterChange('human_attention_required')}
+          >
+            Needs attention
+          </FilterPill>
+          <FilterPill active={statusFilter === 'ai_handling'} onClick={() => onStatusFilterChange('ai_handling')}>
+            AI handling
+          </FilterPill>
+        </div>
+      </div>
+
+      <div className="flex-1 overflow-y-auto">
+        {loading ? (
+          <div className="p-4">
+            <SkeletonList rows={6} />
+          </div>
+        ) : error ? (
+          <div className="p-4">
+            <ErrorState message={error} onRetry={onRetry} />
+          </div>
+        ) : conversations.length === 0 ? (
+          <div className="p-4">
+            <EmptyState icon={InboxIcon} title="No conversations" message="Nothing matches the current filters." />
+          </div>
+        ) : (
+          <ul className="divide-y divide-border">
+            {conversations.map((conv) => (
+              <li key={conv.id}>
+                <button
+                  type="button"
+                  onClick={() => onSelect(conv.id)}
+                  className={cn(
+                    'flex w-full flex-col gap-1.5 px-4 py-3 text-left transition-colors hover:bg-background-muted',
+                    selectedId === conv.id && 'border-l-2 border-brand-500 bg-background-muted'
+                  )}
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="flex items-center gap-1.5 truncate text-sm font-semibold text-foreground">
+                      {conv.full_name || 'Unknown customer'}
+                      {conv.unread_count > 0 && (
+                        <span className="inline-flex h-2 w-2 shrink-0 rounded-full bg-brand-500" aria-label="Unread" />
+                      )}
+                    </span>
+                    <span className="shrink-0 text-xs text-foreground-subtle">{formatTime(conv.last_message_at)}</span>
+                  </div>
+                  <p className="line-clamp-1 text-xs text-foreground-muted">{conv.last_message || 'No messages yet'}</p>
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <Badge tone={CHANNEL_TONE[conv.channel]}>{conv.channel}</Badge>
+                    <Badge tone={MODE_TONE[conv.mode]}>{MODE_LABEL[conv.mode]}</Badge>
+                    <Badge tone="neutral">{STATUS_LABEL[conv.status]}</Badge>
+                  </div>
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function FilterPill({ active, onClick, children }: { active: boolean; onClick: () => void; children: React.ReactNode }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={cn(
+        'rounded-full border px-2.5 py-1 text-xs font-medium transition-colors',
+        active
+          ? 'border-brand-500 bg-brand-500 text-white'
+          : 'border-border-strong text-foreground-muted hover:bg-background-muted'
+      )}
+    >
+      {children}
+    </button>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Middle column — thread + composer
+// ---------------------------------------------------------------------------
+
+function ThreadPanel(props: {
+  selectedId: string | null;
+  detail: ConversationDetail | null;
+  messages: MessageRow[];
+  pendingDrafts: MessageRow[];
+  loading: boolean;
+  error: string | null;
+  onRetry: () => void;
+  onModeChange: (mode: ControlMode) => void;
+  modeUpdating: boolean;
+  replyText: string;
+  onReplyTextChange: (v: string) => void;
+  onSendReply: () => void;
+  sending: boolean;
+  sendError: string | null;
+  onApprove: (id: string) => void;
+  onReject: (id: string) => void;
+  actingMessageId: string | null;
+}) {
+  const {
+    selectedId,
+    detail,
+    messages,
+    pendingDrafts,
+    loading,
+    error,
+    onRetry,
+    onModeChange,
+    modeUpdating,
+    replyText,
+    onReplyTextChange,
+    onSendReply,
+    sending,
+    sendError,
+    onApprove,
+    onReject,
+    actingMessageId,
+  } = props;
+
+  if (!selectedId) {
+    return (
+      <main className="flex flex-1 items-center justify-center bg-background">
+        <EmptyState
+          icon={MessageSquare}
+          title="Select a conversation"
+          message="Choose a conversation from the left to view its thread."
+        />
+      </main>
+    );
+  }
+
+  if (loading) {
+    return (
+      <main className="flex flex-1 flex-col bg-background p-6">
+        <Skeleton className="mb-4 h-10 w-64" />
+        <SkeletonList rows={5} />
+      </main>
+    );
+  }
+
+  if (error || !detail) {
+    return (
+      <main className="flex flex-1 items-center justify-center bg-background p-6">
+        <ErrorState message={error ?? 'Conversation not found.'} onRetry={onRetry} />
+      </main>
+    );
+  }
+
+  return (
+    <main className="flex min-w-0 flex-1 flex-col bg-background">
+      <header className="flex flex-wrap items-center justify-between gap-3 border-b border-border px-5 py-3.5">
+        <div className="flex items-center gap-3">
+          <div className="flex h-10 w-10 items-center justify-center rounded-full bg-background-muted text-sm font-bold text-foreground-muted">
+            {(detail.full_name || '?')[0]?.toUpperCase()}
+          </div>
+          <div>
+            <h3 className="text-sm font-semibold text-foreground">{detail.full_name || 'Unknown customer'}</h3>
+            <div className="flex items-center gap-2 text-xs text-foreground-muted">
+              <Badge tone={CHANNEL_TONE[detail.channel]}>{detail.channel}</Badge>
+              {detail.detected_language && <span>Lang: {detail.detected_language}</span>}
+              {detail.detected_intent && <span>Intent: {detail.detected_intent}</span>}
             </div>
           </div>
-
-          <nav className="space-y-1">
-            <button className="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium bg-sky-500/10 text-sky-400 border border-sky-500/20">
-              <MessageSquare className="w-4 h-4" /> Shared Inbox
-            </button>
-            <button className="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium text-slate-400 hover:bg-slate-800/60 hover:text-slate-200 transition">
-              <Bot className="w-4 h-4" /> Knowledge Base
-            </button>
-            <button className="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium text-slate-400 hover:bg-slate-800/60 hover:text-slate-200 transition">
-              <UserCheck className="w-4 h-4" /> Leads & CRM
-            </button>
-            <button className="w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium text-slate-400 hover:bg-slate-800/60 hover:text-slate-200 transition">
-              <Sparkles className="w-4 h-4" /> Analytics
-            </button>
-          </nav>
         </div>
 
-        <div className="p-3 bg-slate-800/40 rounded-xl border border-slate-800 text-xs text-slate-400">
-          <div className="flex items-center justify-between mb-1">
-            <span className="font-semibold text-slate-300">Workspace</span>
-            <span className="px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">Active</span>
+        <div className="flex items-center gap-2">
+          <span className="text-xs font-medium text-foreground-muted">Mode:</span>
+          <div className="flex gap-1 rounded-lg border border-border bg-background-subtle p-1">
+            {(['auto', 'approval', 'suggestion', 'human'] as ControlMode[]).map((m) => (
+              <button
+                key={m}
+                type="button"
+                disabled={modeUpdating}
+                onClick={() => onModeChange(m)}
+                className={cn(
+                  'rounded-md px-2.5 py-1 text-xs font-semibold transition-colors disabled:opacity-50',
+                  detail.mode === m ? 'bg-brand-500 text-white' : 'text-foreground-muted hover:bg-background-muted'
+                )}
+              >
+                {MODE_LABEL[m]}
+              </button>
+            ))}
           </div>
-          <p className="truncate font-mono">Tashkent Store Hub</p>
         </div>
-      </aside>
+      </header>
 
-      {/* Conversation Thread List */}
-      <section className="w-96 border-r border-slate-800 bg-slate-900/30 flex flex-col">
-        <div className="p-4 border-b border-slate-800 flex items-center justify-between">
-          <h2 className="font-bold text-lg">Inbox Threads</h2>
-          <button className="p-2 rounded-lg bg-slate-800 text-slate-300 hover:bg-slate-700 transition">
-            <RefreshCw className="w-4 h-4" />
-          </button>
+      {detail.status === 'human_attention_required' && (
+        <div className="flex items-center gap-2 border-b border-rose-200 bg-rose-50 px-5 py-2 text-xs text-rose-700">
+          <ShieldAlert className="h-4 w-4 shrink-0" />
+          <span>This conversation was escalated and needs human attention.</span>
         </div>
+      )}
 
-        {/* Filter Pills */}
-        <div className="px-4 py-3 flex gap-2 overflow-x-auto border-b border-slate-800/50 text-xs">
-          <button onClick={() => setActiveFilter('all')} className={`px-2.5 py-1 rounded-full border transition ${activeFilter === 'all' ? 'bg-sky-500 border-sky-500 text-white' : 'border-slate-700 text-slate-400 hover:bg-slate-800'}`}>All</button>
-          <button onClick={() => setActiveFilter('attention')} className={`px-2.5 py-1 rounded-full border transition ${activeFilter === 'attention' ? 'bg-rose-500 border-rose-500 text-white' : 'border-rose-900/50 text-rose-400 hover:bg-rose-950/30'}`}>Human Needed</button>
-          <button onClick={() => setActiveFilter('telegram')} className={`px-2.5 py-1 rounded-full border transition ${activeFilter === 'telegram' ? 'bg-sky-600 border-sky-600 text-white' : 'border-slate-700 text-slate-400'}`}>Telegram</button>
-          <button onClick={() => setActiveFilter('instagram')} className={`px-2.5 py-1 rounded-full border transition ${activeFilter === 'instagram' ? 'bg-pink-600 border-pink-600 text-white' : 'border-slate-700 text-slate-400'}`}>Instagram</button>
-        </div>
+      <div className="flex-1 overflow-y-auto px-5 py-4">
+        {messages.length === 0 ? (
+          <EmptyState icon={MessageSquare} title="No messages yet" message="This conversation has no messages." />
+        ) : (
+          <div className="space-y-3">
+            {messages.map((msg) => (
+              <MessageBubble key={msg.id} message={msg} />
+            ))}
+          </div>
+        )}
 
-        <div className="flex-1 overflow-y-auto divide-y divide-slate-800/40">
-          {filteredConversations.map(conv => (
-            <div
-              key={conv.id}
-              onClick={() => setSelectedConv(conv)}
-              className={`p-4 cursor-pointer transition flex flex-col gap-2 ${selectedConv?.id === conv.id ? 'bg-slate-800/80 border-l-4 border-sky-500' : 'hover:bg-slate-900/80'}`}
-            >
-              <div className="flex items-center justify-between">
-                <span className="font-semibold text-sm text-slate-200">{conv.full_name}</span>
-                <span className="text-xs text-slate-500 font-mono">{conv.last_message_at}</span>
-              </div>
-
-              <p className="text-xs text-slate-400 line-clamp-1">{conv.last_message}</p>
-
-              <div className="flex items-center justify-between text-[11px] pt-1">
-                <span className={`px-2 py-0.5 rounded-full font-medium ${conv.channel === 'telegram' ? 'bg-sky-500/10 text-sky-400' : 'bg-pink-500/10 text-pink-400'}`}>
-                  {conv.channel.toUpperCase()}
-                </span>
-                
-                <span className={`px-2 py-0.5 rounded-full font-semibold ${conv.mode === 'human' ? 'bg-rose-500/20 text-rose-300 border border-rose-500/30' : 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'}`}>
-                  {conv.mode === 'human' ? 'HUMAN OPERATOR' : 'AI AUTO'}
-                </span>
-              </div>
-            </div>
-          ))}
-        </div>
-      </section>
-
-      {/* Selected Conversation Detail & Chat Composer */}
-      {selectedConv ? (
-        <main className="flex-1 flex flex-col bg-slate-950">
-          {/* Top Bar Header */}
-          <header className="p-4 border-b border-slate-800 bg-slate-900/40 flex items-center justify-between">
-            <div className="flex items-center gap-3">
-              <div className="w-10 h-10 rounded-full bg-slate-800 flex items-center justify-center text-slate-300 font-bold">
-                {selectedConv.full_name[0]}
-              </div>
-              <div>
-                <h3 className="font-bold text-base">{selectedConv.full_name}</h3>
-                <div className="flex items-center gap-2 text-xs text-slate-400">
-                  <span>Language: <strong className="uppercase text-sky-400">{selectedConv.detected_language}</strong></span>
-                  <span>•</span>
-                  <span>Intent: <strong className="text-slate-200">{selectedConv.detected_intent}</strong></span>
+        {pendingDrafts.length > 0 && (
+          <div className="mt-6 space-y-3 border-t border-border pt-4">
+            <h4 className="text-xs font-semibold uppercase tracking-wide text-foreground-muted">
+              Pending drafts
+            </h4>
+            {pendingDrafts.map((draft) => (
+              <div key={draft.id} className="rounded-lg border border-amber-200 bg-amber-50 p-3">
+                <p className="text-sm text-foreground">{draft.content}</p>
+                <div className="mt-2 flex items-center justify-between">
+                  <Badge tone="warning">{draft.delivery_status}</Badge>
+                  <div className="flex gap-2">
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      disabled={actingMessageId === draft.id}
+                      onClick={() => onReject(draft.id)}
+                    >
+                      Reject
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="primary"
+                      disabled={actingMessageId === draft.id}
+                      onClick={() => onApprove(draft.id)}
+                    >
+                      Approve
+                    </Button>
+                  </div>
                 </div>
               </div>
-            </div>
-
-            {/* AI vs Human Mode Control Toggle */}
-            <div className="flex items-center gap-3">
-              <span className="text-xs text-slate-400 font-medium">Control Mode:</span>
-              <div className="bg-slate-900 p-1 rounded-xl border border-slate-800 flex gap-1">
-                <button
-                  onClick={() => handleModeToggle('auto')}
-                  className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition ${selectedConv.mode === 'auto' ? 'bg-emerald-500 text-slate-950 shadow-md shadow-emerald-500/20' : 'text-slate-400 hover:text-slate-200'}`}
-                >
-                  <Bot className="w-3.5 h-3.5" /> AI Auto
-                </button>
-                <button
-                  onClick={() => handleModeToggle('human')}
-                  className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition ${selectedConv.mode === 'human' ? 'bg-rose-500 text-white shadow-md shadow-rose-500/20' : 'text-slate-400 hover:text-slate-200'}`}
-                >
-                  <User className="w-3.5 h-3.5" /> Human Takeover
-                </button>
-              </div>
-            </div>
-          </header>
-
-          {/* Attention Banner if Escalated */}
-          {selectedConv.status === 'human_attention_required' && (
-            <div className="bg-rose-950/60 border-b border-rose-800/80 px-4 py-2.5 flex items-center justify-between text-xs text-rose-200">
-              <div className="flex items-center gap-2">
-                <ShieldAlert className="w-4 h-4 text-rose-400 animate-pulse" />
-                <span><strong>Attention Required:</strong> AI auto-escalated this conversation (Refund request / Low confidence).</span>
-              </div>
-              <button onClick={() => handleModeToggle('human')} className="px-3 py-1 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded-md transition">
-                Take Control Now
-              </button>
-            </div>
-          )}
-
-          {/* Chat Messages Log */}
-          <div className="flex-1 overflow-y-auto p-6 space-y-4">
-            <div className="flex justify-start">
-              <div className="bg-slate-800 border border-slate-700/60 p-3.5 rounded-2xl rounded-tl-none max-w-lg text-sm text-slate-200 shadow-sm">
-                <p>{selectedConv.last_message}</p>
-                <span className="text-[10px] text-slate-500 block mt-1">{selectedConv.last_message_at}</span>
-              </div>
-            </div>
-
-            <div className="flex justify-end">
-              <div className="bg-sky-600/90 p-3.5 rounded-2xl rounded-tr-none max-w-lg text-sm text-white shadow-sm shadow-sky-600/20">
-                <p>[AI Agent] Uzbek Latin answer generated from Knowledge Base context.</p>
-                <span className="text-[10px] text-sky-200 block mt-1">01:46 • Confidence 98%</span>
-              </div>
-            </div>
+            ))}
           </div>
+        )}
+      </div>
 
-          {/* Operator Reply Composer */}
-          <footer className="p-4 border-t border-slate-800 bg-slate-900/50">
-            <div className="flex items-center gap-2 bg-slate-950 border border-slate-800 rounded-xl p-2 focus-within:border-sky-500 transition">
-              <input
-                type="text"
-                placeholder={selectedConv.mode === 'auto' ? "AI is responding automatically (Switch to Human Takeover to send manual replies)..." : "Type your message as Human Operator..."}
-                disabled={selectedConv.mode === 'auto'}
-                value={messageInput}
-                onChange={e => setMessageInput(e.target.value)}
-                className="flex-1 bg-transparent px-2 text-sm text-slate-100 placeholder-slate-500 focus:outline-none disabled:opacity-50"
-              />
-              <button
-                disabled={selectedConv.mode === 'auto' || !messageInput.trim()}
-                className="p-2.5 rounded-lg bg-sky-500 text-white hover:bg-sky-400 disabled:bg-slate-800 disabled:text-slate-600 transition"
-              >
-                <Send className="w-4 h-4" />
-              </button>
-            </div>
-          </footer>
-        </main>
-      ) : (
-        <main className="flex-1 flex items-center justify-center text-slate-500 text-sm">
-          Select a conversation from the left to start responding
-        </main>
-      )}
+      <footer className="border-t border-border px-5 py-3.5">
+        {sendError && (
+          <div className="mb-2">
+            <ErrorState
+              title="Send failed"
+              message={sendError}
+              onRetry={onSendReply}
+              className="items-start py-3 text-left"
+            />
+          </div>
+        )}
+        <div className="flex items-center gap-2">
+          <input
+            type="text"
+            placeholder={
+              detail.mode === 'human'
+                ? 'Type your reply as human operator...'
+                : `Switch to Human mode to send a manual reply (current: ${MODE_LABEL[detail.mode]})`
+            }
+            disabled={detail.mode !== 'human' || sending}
+            value={replyText}
+            onChange={(e) => onReplyTextChange(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && !sending) onSendReply();
+            }}
+            className="h-10 flex-1 rounded-md border border-border-strong bg-background px-3 text-sm text-foreground placeholder:text-foreground-subtle focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 disabled:opacity-50"
+          />
+          <Button
+            disabled={detail.mode !== 'human' || !replyText.trim() || sending}
+            onClick={onSendReply}
+          >
+            <Send className="h-4 w-4" />
+            {sending ? 'Sending...' : 'Send'}
+          </Button>
+        </div>
+      </footer>
+    </main>
+  );
+}
+
+function MessageBubble({ message }: { message: MessageRow }) {
+  const isCustomer = message.sender === 'customer';
+  const isSystem = message.sender === 'system';
+  const senderLabel =
+    message.sender === 'ai' ? 'AI Agent' : message.sender === 'human_operator' ? 'Human Operator' : message.sender === 'system' ? 'System' : null;
+
+  if (isSystem) {
+    return (
+      <div className="flex justify-center">
+        <span className="rounded-full bg-background-muted px-3 py-1 text-xs text-foreground-subtle">{message.content}</span>
+      </div>
+    );
+  }
+
+  return (
+    <div className={cn('flex', isCustomer ? 'justify-start' : 'justify-end')}>
+      <div
+        className={cn(
+          'max-w-lg rounded-2xl px-3.5 py-2.5 text-sm shadow-sm',
+          isCustomer
+            ? 'rounded-tl-none border border-border bg-background-subtle text-foreground'
+            : 'rounded-tr-none bg-brand-500 text-white'
+        )}
+      >
+        {senderLabel && (
+          <span className={cn('mb-1 flex items-center gap-1 text-[11px] font-semibold', isCustomer ? 'text-foreground-muted' : 'text-white/80')}>
+            {message.sender === 'ai' ? <Bot className="h-3 w-3" /> : <User className="h-3 w-3" />}
+            {senderLabel}
+          </span>
+        )}
+        <p className="whitespace-pre-wrap">{message.content}</p>
+        <span className={cn('mt-1 block text-[10px]', isCustomer ? 'text-foreground-subtle' : 'text-white/70')}>
+          {formatTime(message.created_at)}
+          {message.ai_confidence != null && ` • Confidence ${(message.ai_confidence * 100).toFixed(0)}%`}
+          {message.delivery_status && message.delivery_status !== 'sent' && ` • ${message.delivery_status}`}
+        </span>
+      </div>
     </div>
   );
+}
+
+// ---------------------------------------------------------------------------
+// Right column — customer/lead context (only rendered where width permits)
+// ---------------------------------------------------------------------------
+
+function ContextPanel({ detail, lead }: { detail: ConversationDetail | null; lead: LeadRow | null }) {
+  if (!detail) return null;
+
+  return (
+    <aside className="hidden w-72 shrink-0 flex-col gap-4 overflow-y-auto border-l border-border bg-background-subtle p-4 xl:flex">
+      <div>
+        <h4 className="mb-2 text-xs font-semibold uppercase tracking-wide text-foreground-muted">Customer</h4>
+        <div className="space-y-1.5 rounded-lg border border-border bg-background p-3 text-sm">
+          <div className="font-semibold text-foreground">{detail.full_name || 'Unknown'}</div>
+          {detail.email && <div className="text-foreground-muted">{detail.email}</div>}
+          {detail.phone_number && <div className="text-foreground-muted">{detail.phone_number}</div>}
+          {detail.telegram_username && <div className="text-foreground-muted">@{detail.telegram_username} (Telegram)</div>}
+          {detail.instagram_username && <div className="text-foreground-muted">@{detail.instagram_username} (Instagram)</div>}
+        </div>
+      </div>
+
+      <div>
+        <h4 className="mb-2 text-xs font-semibold uppercase tracking-wide text-foreground-muted">Conversation</h4>
+        <div className="space-y-1.5 rounded-lg border border-border bg-background p-3 text-sm text-foreground-muted">
+          <div>Status: <Badge tone="neutral">{STATUS_LABEL[detail.status]}</Badge></div>
+          {detail.sentiment && <div>Sentiment: {detail.sentiment}</div>}
+          {detail.lead_score != null && <div>Lead score: {detail.lead_score}</div>}
+        </div>
+      </div>
+
+      <div>
+        <h4 className="mb-2 text-xs font-semibold uppercase tracking-wide text-foreground-muted">Lead</h4>
+        {lead ? (
+          <a
+            href="/leads"
+            className="block rounded-lg border border-border bg-background p-3 text-sm text-brand-600 hover:underline"
+          >
+            View linked lead ({lead.status})
+          </a>
+        ) : (
+          <p className="rounded-lg border border-dashed border-border bg-background p-3 text-sm text-foreground-subtle">
+            No linked lead for this conversation.
+          </p>
+        )}
+      </div>
+    </aside>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function formatTime(iso: string) {
+  try {
+    return new Date(iso).toLocaleString(undefined, {
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+  } catch {
+    return iso;
+  }
 }
