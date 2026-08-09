@@ -20,6 +20,7 @@
     "ci-check": "bash scripts/ci-check.sh"
   },
   "dependencies": {
+    "@supabase/ssr": "^0.12.4",
     "@supabase/supabase-js": "^2.45.0",
     "bcryptjs": "^3.0.3",
     "clsx": "^2.1.1",
