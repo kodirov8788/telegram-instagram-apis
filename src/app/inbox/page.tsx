@@ -14,6 +14,7 @@ import {
 import { AppShell, EmptyState, ErrorState, Skeleton, SkeletonList } from '@/components/shell';
 import { Badge, Button, Input, type BadgeTone } from '@/components/ui';
 import { cn } from '@/lib/utils';
+import { useWorkspace } from '@/lib/workspace/context';
 
 // ---------------------------------------------------------------------------
 // Types — mirror the shapes returned by /api/conversations, /api/conversations/:id
@@ -117,6 +118,21 @@ async function readJson(res: Response) {
 }
 
 export default function InboxPage() {
+  // `useWorkspace()` must be called from a DESCENDANT of the
+  // `WorkspaceProvider` that `AppShell` mounts — InboxPage itself renders
+  // `AppShell`, so it sits above the provider in the tree and can't call
+  // the hook directly. `InboxPageInner` is rendered as AppShell's child so
+  // the hook resolves correctly.
+  return (
+    <AppShell className="p-0 sm:p-0">
+      <InboxPageInner />
+    </AppShell>
+  );
+}
+
+function InboxPageInner() {
+  const { apiFetch, activeWorkspace, loading: workspaceLoading, error: workspaceError } = useWorkspace();
+
   // Conversation list state
   const [conversations, setConversations] = useState<ConversationListItem[]>([]);
   const [listLoading, setListLoading] = useState(true);
@@ -150,10 +166,11 @@ export default function InboxPage() {
   const [lead, setLead] = useState<LeadRow | null>(null);
 
   const fetchConversations = useCallback(async () => {
+    if (!activeWorkspace) return;
     setListLoading(true);
     setListError(null);
     try {
-      const res = await fetch('/api/conversations', { credentials: 'same-origin' });
+      const res = await apiFetch('/api/conversations');
       const body = await readJson(res);
       if (!res.ok) throw new Error(body?.error || `Failed to load conversations (${res.status})`);
       setConversations(body.conversations ?? []);
@@ -162,19 +179,20 @@ export default function InboxPage() {
     } finally {
       setListLoading(false);
     }
-  }, []);
+  }, [apiFetch, activeWorkspace]);
 
   useEffect(() => {
-    fetchConversations();
-  }, [fetchConversations]);
+    if (activeWorkspace) fetchConversations();
+  }, [fetchConversations, activeWorkspace]);
 
   const fetchThread = useCallback(async (conversationId: string) => {
+    if (!activeWorkspace) return;
     setThreadLoading(true);
     setThreadError(null);
     try {
       const [convRes, draftsRes] = await Promise.all([
-        fetch(`/api/conversations/${conversationId}`, { credentials: 'same-origin' }),
-        fetch(`/api/messages?conversationId=${conversationId}`, { credentials: 'same-origin' }),
+        apiFetch(`/api/conversations/${conversationId}`),
+        apiFetch(`/api/messages?conversationId=${conversationId}`),
       ]);
       const convBody = await readJson(convRes);
       if (!convRes.ok) throw new Error(convBody?.error || `Failed to load conversation (${convRes.status})`);
@@ -192,7 +210,7 @@ export default function InboxPage() {
     } finally {
       setThreadLoading(false);
     }
-  }, []);
+  }, [apiFetch, activeWorkspace]);
 
   useEffect(() => {
     if (!selectedId) {
@@ -202,16 +220,16 @@ export default function InboxPage() {
       setLead(null);
       return;
     }
-    fetchThread(selectedId);
-  }, [selectedId, fetchThread]);
+    if (activeWorkspace) fetchThread(selectedId);
+  }, [selectedId, fetchThread, activeWorkspace]);
 
   // Best-effort linked-lead lookup: /api/leads has no conversation_id filter
   // param, so fetch the workspace's leads and match client-side. Falls back
   // silently (context panel just omits the lead link) if this fails.
   useEffect(() => {
-    if (!selectedId) return;
+    if (!selectedId || !activeWorkspace) return;
     let cancelled = false;
-    fetch('/api/leads', { credentials: 'same-origin' })
+    apiFetch('/api/leads')
       .then(readJson)
       .then((body) => {
         if (cancelled) return;
@@ -224,7 +242,7 @@ export default function InboxPage() {
     return () => {
       cancelled = true;
     };
-  }, [selectedId]);
+  }, [selectedId, apiFetch, activeWorkspace]);
 
   const filteredConversations = useMemo(() => {
     return conversations.filter((c) => {
@@ -249,9 +267,8 @@ export default function InboxPage() {
     if (!detail || modeUpdating) return;
     setModeUpdating(true);
     try {
-      const res = await fetch('/api/conversations', {
+      const res = await apiFetch('/api/conversations', {
         method: 'PATCH',
-        credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ conversationId: detail.id, mode }),
       });
@@ -273,9 +290,8 @@ export default function InboxPage() {
     setSending(true);
     setSendError(null);
     try {
-      const res = await fetch('/api/messages', {
+      const res = await apiFetch('/api/messages', {
         method: 'POST',
-        credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ conversationId: detail.id, content: replyText.trim() }),
       });
@@ -295,9 +311,8 @@ export default function InboxPage() {
     if (actingMessageId) return;
     setActingMessageId(messageId);
     try {
-      const res = await fetch(`/api/messages/${messageId}/approve`, {
+      const res = await apiFetch(`/api/messages/${messageId}/approve`, {
         method: 'POST',
-        credentials: 'same-origin',
       });
       const body = await readJson(res);
       if (!res.ok) throw new Error(body?.error || `Failed to approve (${res.status})`);
@@ -313,9 +328,8 @@ export default function InboxPage() {
     if (actingMessageId) return;
     setActingMessageId(messageId);
     try {
-      const res = await fetch(`/api/messages/${messageId}/reject`, {
+      const res = await apiFetch(`/api/messages/${messageId}/reject`, {
         method: 'POST',
-        credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({}),
       });
@@ -329,48 +343,80 @@ export default function InboxPage() {
     }
   };
 
-  return (
-    <AppShell className="p-0 sm:p-0">
-      <div className="flex h-full min-h-0 w-full">
-        <ConversationListPanel
-          conversations={filteredConversations}
-          loading={listLoading}
-          error={listError}
-          onRetry={fetchConversations}
-          onRefresh={fetchConversations}
-          selectedId={selectedId}
-          onSelect={handleSelectConversation}
-          search={search}
-          onSearchChange={setSearch}
-          statusFilter={statusFilter}
-          onStatusFilterChange={setStatusFilter}
-          channelFilter={channelFilter}
-          onChannelFilterChange={setChannelFilter}
-        />
-
-        <ThreadPanel
-          selectedId={selectedId}
-          detail={detail}
-          messages={messages}
-          pendingDrafts={pendingDrafts}
-          loading={threadLoading}
-          error={threadError}
-          onRetry={() => selectedId && fetchThread(selectedId)}
-          onModeChange={handleModeChange}
-          modeUpdating={modeUpdating}
-          replyText={replyText}
-          onReplyTextChange={setReplyText}
-          onSendReply={handleSendReply}
-          sending={sending}
-          sendError={sendError}
-          onApprove={handleApprove}
-          onReject={handleReject}
-          actingMessageId={actingMessageId}
-        />
-
-        <ContextPanel detail={detail} lead={lead} />
+  // Workspace discovery still in flight — the shared context, not this
+  // page, owns that loading state.
+  if (workspaceLoading) {
+    return (
+      <div className="flex h-full min-h-0 w-full items-center justify-center">
+        <Skeleton className="h-8 w-48" />
       </div>
-    </AppShell>
+    );
+  }
+
+  if (workspaceError) {
+    return (
+      <div className="flex h-full min-h-0 w-full items-center justify-center p-6">
+        <ErrorState title="Couldn't load your workspace" message={workspaceError} />
+      </div>
+    );
+  }
+
+  // No workspace selected yet — either the user has none (onboarding
+  // territory, handled by middleware redirect before this page can even
+  // render) or has multiple with none chosen (workspace-switcher UI is a
+  // separate future concern, not this page's job to build).
+  if (!activeWorkspace) {
+    return (
+      <div className="flex h-full min-h-0 w-full items-center justify-center p-6">
+        <EmptyState
+          icon={InboxIcon}
+          title="No workspace selected"
+          message="Select a workspace to view its inbox."
+        />
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex h-full min-h-0 w-full">
+      <ConversationListPanel
+        conversations={filteredConversations}
+        loading={listLoading}
+        error={listError}
+        onRetry={fetchConversations}
+        onRefresh={fetchConversations}
+        selectedId={selectedId}
+        onSelect={handleSelectConversation}
+        search={search}
+        onSearchChange={setSearch}
+        statusFilter={statusFilter}
+        onStatusFilterChange={setStatusFilter}
+        channelFilter={channelFilter}
+        onChannelFilterChange={setChannelFilter}
+      />
+
+      <ThreadPanel
+        selectedId={selectedId}
+        detail={detail}
+        messages={messages}
+        pendingDrafts={pendingDrafts}
+        loading={threadLoading}
+        error={threadError}
+        onRetry={() => selectedId && fetchThread(selectedId)}
+        onModeChange={handleModeChange}
+        modeUpdating={modeUpdating}
+        replyText={replyText}
+        onReplyTextChange={setReplyText}
+        onSendReply={handleSendReply}
+        sending={sending}
+        sendError={sendError}
+        onApprove={handleApprove}
+        onReject={handleReject}
+        actingMessageId={actingMessageId}
+      />
+
+      <ContextPanel detail={detail} lead={lead} />
+    </div>
   );
 }
 
