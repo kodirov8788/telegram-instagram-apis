@@ -1,5 +1,12 @@
 import "./globals.css";
 import type { Metadata } from "next";
+import { Inter } from "next/font/google";
+
+const inter = Inter({
+  subsets: ["latin"],
+  variable: "--font-inter",
+  display: "swap",
+});
 
 export const metadata: Metadata = {
   title: "YDeck - Telegram & Instagram Customer Communication Agent",
@@ -12,8 +19,8 @@ export default function RootLayout({
   children: React.ReactNode;
 }) {
   return (
-    <html lang="en">
-      <body className="antialiased bg-slate-900 text-slate-100 min-h-screen">
+    <html lang="en" className={inter.variable}>
+      <body className="antialiased bg-background text-foreground min-h-screen font-sans">
         {children}
       </body>
     </html>
