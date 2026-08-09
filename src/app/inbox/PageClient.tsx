@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
+  ArrowLeft,
   Bot,
   Inbox as InboxIcon,
   MessageSquare,
@@ -263,6 +264,11 @@ function InboxPageInner() {
     setSendError(null);
   };
 
+  // Mobile/narrow screens get a list -> thread stack instead of squeezing a
+  // multi-column layout: only one of the list/thread panels is visible at a
+  // time below the `md` breakpoint, with a back button in the thread header.
+  const handleBackToList = () => setSelectedId(null);
+
   const handleModeChange = async (mode: ControlMode) => {
     if (!detail || modeUpdating) return;
     setModeUpdating(true);
@@ -393,6 +399,7 @@ function InboxPageInner() {
         onStatusFilterChange={setStatusFilter}
         channelFilter={channelFilter}
         onChannelFilterChange={setChannelFilter}
+        className={cn('w-full md:max-w-sm', selectedId && 'hidden md:flex')}
       />
 
       <ThreadPanel
@@ -413,6 +420,8 @@ function InboxPageInner() {
         onApprove={handleApprove}
         onReject={handleReject}
         actingMessageId={actingMessageId}
+        onBack={handleBackToList}
+        className={cn(!selectedId && 'hidden md:flex')}
       />
 
       <ContextPanel detail={detail} lead={lead} />
@@ -438,6 +447,7 @@ function ConversationListPanel(props: {
   onStatusFilterChange: (v: 'all' | ConversationStatus) => void;
   channelFilter: 'all' | ChannelType;
   onChannelFilterChange: (v: 'all' | ChannelType) => void;
+  className?: string;
 }) {
   const {
     conversations,
@@ -453,10 +463,11 @@ function ConversationListPanel(props: {
     onStatusFilterChange,
     channelFilter,
     onChannelFilterChange,
+    className,
   } = props;
 
   return (
-    <section className="flex w-full max-w-sm shrink-0 flex-col border-r border-border bg-background-subtle">
+    <section className={cn('flex shrink-0 flex-col border-r border-border bg-background-subtle', className)}>
       <div className="flex items-center justify-between border-b border-border px-4 py-3">
         <h2 className="text-base font-semibold text-foreground">Inbox</h2>
         <Button variant="ghost" size="sm" onClick={onRefresh} aria-label="Refresh conversations">
@@ -468,6 +479,7 @@ function ConversationListPanel(props: {
         <div className="relative">
           <Search className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-foreground-subtle" />
           <Input
+            aria-label="Search conversations"
             placeholder="Search conversations..."
             value={search}
             onChange={(e) => onSearchChange(e.target.value)}
@@ -590,6 +602,8 @@ function ThreadPanel(props: {
   onApprove: (id: string) => void;
   onReject: (id: string) => void;
   actingMessageId: string | null;
+  onBack?: () => void;
+  className?: string;
 }) {
   const {
     selectedId,
@@ -609,11 +623,13 @@ function ThreadPanel(props: {
     onApprove,
     onReject,
     actingMessageId,
+    onBack,
+    className,
   } = props;
 
   if (!selectedId) {
     return (
-      <main className="flex flex-1 items-center justify-center bg-background">
+      <main className={cn('flex flex-1 items-center justify-center bg-background', className)}>
         <EmptyState
           icon={MessageSquare}
           title="Select a conversation"
@@ -625,7 +641,7 @@ function ThreadPanel(props: {
 
   if (loading) {
     return (
-      <main className="flex flex-1 flex-col bg-background p-6">
+      <main className={cn('flex flex-1 flex-col bg-background p-6', className)}>
         <Skeleton className="mb-4 h-10 w-64" />
         <SkeletonList rows={5} />
       </main>
@@ -634,16 +650,27 @@ function ThreadPanel(props: {
 
   if (error || !detail) {
     return (
-      <main className="flex flex-1 items-center justify-center bg-background p-6">
+      <main className={cn('flex flex-1 items-center justify-center bg-background p-6', className)}>
         <ErrorState message={error ?? 'Conversation not found.'} onRetry={onRetry} />
       </main>
     );
   }
 
   return (
-    <main className="flex min-w-0 flex-1 flex-col bg-background">
+    <main className={cn('flex min-w-0 flex-1 flex-col bg-background', className)}>
       <header className="flex flex-wrap items-center justify-between gap-3 border-b border-border px-5 py-3.5">
         <div className="flex items-center gap-3">
+          {onBack && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={onBack}
+              aria-label="Back to conversation list"
+              className="md:hidden"
+            >
+              <ArrowLeft className="h-4 w-4" />
+            </Button>
+          )}
           <div className="flex h-10 w-10 items-center justify-center rounded-full bg-background-muted text-sm font-bold text-foreground-muted">
             {(detail.full_name || '?')[0]?.toUpperCase()}
           </div>
@@ -745,6 +772,7 @@ function ThreadPanel(props: {
         <div className="flex items-center gap-2">
           <input
             type="text"
+            aria-label="Reply message"
             placeholder={
               detail.mode === 'human'
                 ? 'Type your reply as human operator...'
