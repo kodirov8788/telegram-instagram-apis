@@ -1,0 +1,21 @@
+-- Issue: `ydeck_tenant_runtime_v2` (the restricted role every tenant-scoped
+-- API route runs as, via `withLiveAuthorization`/`tenantTransaction`) was
+-- never granted any privilege on `users` at all, in the original RBAC setup
+-- (migration 002) — that migration's grant list enumerates every other
+-- tenant-facing table but omits `users`. This went unnoticed until this
+-- session's real production runtime validation: `GET /api/workspace/members`
+-- (which JOINs `workspace_members` to `users` for email/full_name) is the
+-- first tenant-scoped query in this codebase's history to actually touch
+-- `users` while running as this restricted role, and it failed with
+-- "permission denied for table users" (42501) live in production.
+--
+-- Grant SELECT only (not INSERT/UPDATE/DELETE): `users` rows are managed by
+-- the auth/signup flow (Supabase Auth + the AUTH-01 sync trigger) and the
+-- identity-scoped `identityTransaction` path, not by tenant-scoped CRUD —
+-- no tenant-facing route should ever need to write to `users` directly.
+-- No RLS policy on `users` is added or changed here; `users` has no
+-- `workspace_id` column to scope by (it's a global identity table), so a
+-- plain grant — the same pattern already used for `authenticated`/`anon`/
+-- `service_role` on this table — is the correct, minimal fix.
+
+GRANT SELECT ON public.users TO ydeck_tenant_runtime_v2;
