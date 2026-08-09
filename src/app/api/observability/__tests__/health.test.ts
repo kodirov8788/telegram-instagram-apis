@@ -7,30 +7,33 @@ vi.mock('@/lib/db', () => ({
   tenantTransaction: vi.fn(async (_userId: string, operation: (client: { query: typeof query }) => unknown) => operation({ query })),
   default: { connect: vi.fn() },
 }));
+vi.mock('@/lib/supabase/server', async () => {
+  const m = await import('@/lib/auth/__tests__/supabase-session-mock');
+  return { createSupabaseServerClient: m.mockCreateSupabaseServerClient };
+});
 
 import { query } from '@/lib/db';
 import { GET } from '../health/route';
+import { setMockSupabaseUser } from '@/lib/auth/__tests__/supabase-session-mock';
 
 const db = vi.mocked(query);
 
 const wid = '11111111-1111-4111-8111-111111111111';
-const headers = { cookie: `session=${'a'.repeat(64)}`, 'x-workspace-id': wid };
+const headers = { 'x-workspace-id': wid };
 const req = () => new NextRequest('https://app.test/api/observability/health', { headers });
 
-const session = () => db.mockResolvedValueOnce({ rows: [{ user_id: 'user-1', email: 'u@test.dev' }] } as never);
 const member = (role = 'support_operator') => db.mockResolvedValueOnce({ rows: [{ role }] } as never);
 
-beforeEach(() => db.mockReset());
+beforeEach(() => { db.mockReset(); setMockSupabaseUser({ id: 'user-1', email: 'u@test.dev' }); });
 
 describe('GET /api/observability/health', () => {
   it('requires authentication', async () => {
-    db.mockResolvedValueOnce({ rows: [] } as never);
+    setMockSupabaseUser(null);
     const res = await GET(req());
     expect(res.status).toBe(401);
   });
 
   it('reports null age and zero backlog when nothing is waiting', async () => {
-    session();
     member();
     db.mockResolvedValueOnce({ rows: [{ backlog: 0, oldest: null }] } as never); // inbound
     db.mockResolvedValueOnce({ rows: [{ backlog: 0, oldest: null }] } as never); // outbound
@@ -45,7 +48,6 @@ describe('GET /api/observability/health', () => {
   });
 
   it('computes a positive age in ms when a backlog exists, scoped to the caller workspace', async () => {
-    session();
     member();
     const oldest = new Date(Date.now() - 60_000).toISOString();
     db.mockResolvedValueOnce({ rows: [{ backlog: 2, oldest }] } as never);

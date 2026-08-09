@@ -8,32 +8,36 @@ vi.mock('@/lib/db', () => ({
   default: { connect: vi.fn() },
 }));
 vi.mock('@/lib/services/audit-log', () => ({ AuditLogService: { logEvent: vi.fn() } }));
+vi.mock('@/lib/supabase/server', async () => {
+  const m = await import('@/lib/auth/__tests__/supabase-session-mock');
+  return { createSupabaseServerClient: m.mockCreateSupabaseServerClient };
+});
 
 import { query } from '@/lib/db';
 import { AuditLogService } from '@/lib/services/audit-log';
 import { POST as resolve } from '../[jobId]/resolve/route';
+import { setMockSupabaseUser } from '@/lib/auth/__tests__/supabase-session-mock';
 
 const db = vi.mocked(query);
 const audit = vi.mocked(AuditLogService.logEvent);
 
 const wid = '11111111-1111-4111-8111-111111111111';
 const jid = '22222222-2222-4222-8222-222222222222';
-const headers = { cookie: `session=${'a'.repeat(64)}`, 'x-workspace-id': wid, 'content-type': 'application/json' };
+const headers = { 'x-workspace-id': wid, 'content-type': 'application/json' };
 const ctx = { params: Promise.resolve({ jobId: jid }) };
 const req = (body: object) => new NextRequest(`https://app.test/api/outbound-jobs/${jid}/resolve`, { method: 'POST', headers, body: JSON.stringify(body) });
 
-const session = () => db.mockResolvedValueOnce({ rows: [{ user_id: 'user-1', email: 'u@test.dev' }] } as never);
 const member = (role = 'support_operator') => db.mockResolvedValueOnce({ rows: [{ role }] } as never);
 const owned = () => db.mockResolvedValueOnce({ rows: [{ id: jid }] } as never);
 
 beforeEach(() => {
   db.mockReset();
   audit.mockReset();
+  setMockSupabaseUser({ id: 'user-1', email: 'u@test.dev' });
 });
 
 describe('POST /api/outbound-jobs/:id/resolve', () => {
   it('resolves confirmed_delivered by marking the job sent, no re-dispatch implied', async () => {
-    session();
     member();
     owned();
     db.mockResolvedValueOnce({ rows: [{ id: jid, status: 'sent' }] } as never); // resolveAmbiguousJob's UPDATE
@@ -45,7 +49,6 @@ describe('POST /api/outbound-jobs/:id/resolve', () => {
   });
 
   it('resolves confirmed_not_delivered by scheduling a safe retry (dispatched_at cleared)', async () => {
-    session();
     member();
     owned();
     db.mockResolvedValueOnce({ rows: [{ id: jid, status: 'retryable_failed' }] } as never);
@@ -59,7 +62,6 @@ describe('POST /api/outbound-jobs/:id/resolve', () => {
   });
 
   it('rejects resolving a job that is not currently ambiguous', async () => {
-    session();
     member();
     owned();
     db.mockResolvedValueOnce({ rows: [] } as never); // resolveAmbiguousJob's UPDATE matched nothing
@@ -70,7 +72,6 @@ describe('POST /api/outbound-jobs/:id/resolve', () => {
   });
 
   it('returns 404 for a job outside the caller workspace', async () => {
-    session();
     member();
     db.mockResolvedValueOnce({ rows: [] } as never); // tenant-ownership check finds nothing
 

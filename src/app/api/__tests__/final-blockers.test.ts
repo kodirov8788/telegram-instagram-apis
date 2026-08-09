@@ -3,20 +3,24 @@ import { NextRequest } from 'next/server';
 
 const mocks = vi.hoisted(() => ({ query: vi.fn(), tenantTransaction: vi.fn() }));
 vi.mock('@/lib/db', () => ({ query: mocks.query, tenantTransaction: mocks.tenantTransaction, default: { connect: vi.fn() } }));
+vi.mock('@/lib/supabase/server', async () => {
+  const m = await import('@/lib/auth/__tests__/supabase-session-mock');
+  return { createSupabaseServerClient: m.mockCreateSupabaseServerClient };
+});
 import { withLiveAuthorization } from '@/lib/auth/session';
+import { setMockSupabaseUser } from '@/lib/auth/__tests__/supabase-session-mock';
 const { query, tenantTransaction } = mocks;
 
 const wid = '11111111-1111-4111-8111-111111111111';
 const uid = '22222222-2222-4222-8222-222222222222';
 const request = () => new NextRequest('https://app.test/api/conversations', {
-  headers: { cookie: `session=${'a'.repeat(64)}`, 'x-workspace-id': wid },
+  headers: { 'x-workspace-id': wid },
 });
 
-beforeEach(() => { query.mockReset(); tenantTransaction.mockReset(); });
+beforeEach(() => { query.mockReset(); tenantTransaction.mockReset(); setMockSupabaseUser({ id: uid, email: 'u@test.dev' }); });
 
 describe('atomic live authorization', () => {
   it('locks and authorizes membership inside the same tenant transaction as the operation', async () => {
-    query.mockResolvedValueOnce({ rows: [{ user_id: uid, email: 'u@test.dev' }] });
     const client = { query: vi.fn().mockResolvedValueOnce({ rows: [{ role: 'admin' }] }) };
     tenantTransaction.mockImplementationOnce(async (_uid: string, fn: (c: typeof client) => unknown) => fn(client));
     const callback = vi.fn(async () => 'ok');
@@ -27,7 +31,6 @@ describe('atomic live authorization', () => {
   });
 
   it('fails closed before invoking the operation after a live demotion', async () => {
-    query.mockResolvedValueOnce({ rows: [{ user_id: uid, email: 'u@test.dev' }] });
     const client = { query: vi.fn().mockResolvedValueOnce({ rows: [{ role: 'support_operator' }] }) };
     tenantTransaction.mockImplementationOnce(async (_uid: string, fn: (c: typeof client) => unknown) => fn(client));
     const callback = vi.fn();
