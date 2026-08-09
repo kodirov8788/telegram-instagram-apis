@@ -5,6 +5,7 @@ import { Dialog, DialogFooter } from "@/components/ui/Dialog";
 import { Button, Input } from "@/components/ui";
 import { ErrorBanner } from "@/components/shell/ErrorState";
 import type { KnowledgeCategory, KnowledgeItem, KnowledgeLanguage } from "./types";
+import { useWorkspace } from "@/lib/workspace/context";
 
 const CATEGORIES: KnowledgeCategory[] = ["faq", "catalog", "policy", "script"];
 const LANGUAGES: KnowledgeLanguage[] = ["uz", "ru", "en"];
@@ -35,6 +36,7 @@ const emptyForm: FormState = {
 };
 
 export function KnowledgeFormDialog({ open, item, onClose, onSaved }: KnowledgeFormDialogProps) {
+  const { apiFetch } = useWorkspace();
   const [form, setForm] = useState<FormState>(emptyForm);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -71,7 +73,7 @@ export function KnowledgeFormDialog({ open, item, onClose, onSaved }: KnowledgeF
         validUntil: form.validUntil || null,
       };
 
-      const res = await fetch(isEdit ? `/api/knowledge/${item!.id}` : "/api/knowledge", {
+      const res = await apiFetch(isEdit ? `/api/knowledge/${item!.id}` : "/api/knowledge", {
         method: isEdit ? "PATCH" : "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),

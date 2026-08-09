@@ -8,6 +8,7 @@ import { SkeletonText } from "@/components/shell/Skeleton";
 import { ErrorBanner } from "@/components/shell/ErrorState";
 import type { Lead } from "./types";
 import { leadSource, statusTone } from "./utils";
+import { useWorkspace } from "@/lib/workspace/context";
 
 interface LeadDetailDialogProps {
   leadId: string | null;
@@ -15,6 +16,7 @@ interface LeadDetailDialogProps {
 }
 
 export function LeadDetailDialog({ leadId, onClose }: LeadDetailDialogProps) {
+  const { apiFetch } = useWorkspace();
   const [lead, setLead] = useState<Lead | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -26,7 +28,7 @@ export function LeadDetailDialog({ leadId, onClose }: LeadDetailDialogProps) {
     setError(null);
     setLead(null);
 
-    fetch(`/api/leads/${leadId}`)
+    apiFetch(`/api/leads/${leadId}`)
       .then(async (res) => {
         const body = await res.json().catch(() => ({}));
         if (!res.ok) throw new Error(body?.error || "Failed to load lead");
@@ -42,7 +44,7 @@ export function LeadDetailDialog({ leadId, onClose }: LeadDetailDialogProps) {
     return () => {
       cancelled = true;
     };
-  }, [leadId]);
+  }, [leadId, apiFetch]);
 
   return (
     <Dialog open={!!leadId} onClose={onClose} title="Lead detail" className="max-w-lg">

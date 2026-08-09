@@ -20,6 +20,7 @@ import {
 import { LeadDetailDialog } from "./LeadDetailDialog";
 import { leadSource, statusTone } from "./utils";
 import type { Lead, LeadStatus } from "./types";
+import { useWorkspace } from "@/lib/workspace/context";
 
 const STATUSES: LeadStatus[] = [
   "unqualified",
@@ -33,6 +34,18 @@ const STATUSES: LeadStatus[] = [
 ];
 
 export default function LeadsPage() {
+  // useWorkspace() must be called from a descendant of the WorkspaceProvider
+  // AppShell mounts — this page renders AppShell itself, so the actual body
+  // lives in LeadsPageInner, rendered as AppShell's child.
+  return (
+    <AppShell>
+      <LeadsPageInner />
+    </AppShell>
+  );
+}
+
+function LeadsPageInner() {
+  const { apiFetch, activeWorkspace, loading: workspaceLoading, error: workspaceError } = useWorkspace();
   const [leads, setLeads] = useState<Lead[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -40,12 +53,13 @@ export default function LeadsPage() {
   const [selectedLeadId, setSelectedLeadId] = useState<string | null>(null);
 
   const load = useCallback(async () => {
+    if (!activeWorkspace) return;
     setLoading(true);
     setError(null);
     try {
       const params = new URLSearchParams();
       if (status) params.set("status", status);
-      const res = await fetch(`/api/leads?${params.toString()}`);
+      const res = await apiFetch(`/api/leads?${params.toString()}`);
       const body = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(body?.error || "Failed to load leads");
       setLeads(body.leads ?? []);
@@ -54,14 +68,32 @@ export default function LeadsPage() {
     } finally {
       setLoading(false);
     }
-  }, [status]);
+  }, [status, apiFetch, activeWorkspace]);
 
   useEffect(() => {
-    load();
-  }, [load]);
+    if (activeWorkspace) load();
+  }, [load, activeWorkspace]);
+
+  if (workspaceLoading) {
+    return <SkeletonList rows={6} />;
+  }
+
+  if (workspaceError) {
+    return <ErrorState title="Couldn't load your workspace" message={workspaceError} />;
+  }
+
+  if (!activeWorkspace) {
+    return (
+      <EmptyState
+        icon={Users}
+        title="No workspace selected"
+        message="Select a workspace to view its leads."
+      />
+    );
+  }
 
   return (
-    <AppShell>
+    <>
       <div className="space-y-6">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
@@ -70,7 +102,10 @@ export default function LeadsPage() {
               Qualified prospects captured from Telegram and Instagram conversations.
             </p>
           </div>
-          <Link href="/api/leads/export">
+          {/* A plain <Link> navigation can't attach the x-workspace-id header,
+              so the workspace id is passed as a query param instead — accepted
+              by selectedWorkspace()'s fallback (header ?? workspace_id ?? id). */}
+          <Link href={`/api/leads/export?workspace_id=${activeWorkspace.id}`}>
             <Button variant="secondary" size="md">
               <Download className="h-4 w-4" />
               Export CSV
@@ -166,6 +201,6 @@ export default function LeadsPage() {
       </div>
 
       <LeadDetailDialog leadId={selectedLeadId} onClose={() => setSelectedLeadId(null)} />
-    </AppShell>
+    </>
   );
 }

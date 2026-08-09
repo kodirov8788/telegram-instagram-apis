@@ -18,6 +18,7 @@ import {
 } from "@/components/ui";
 import { KnowledgeFormDialog } from "./KnowledgeFormDialog";
 import type { KnowledgeItem, KnowledgeCategory, KnowledgeLanguage } from "./types";
+import { useWorkspace } from "@/lib/workspace/context";
 
 const CATEGORIES: KnowledgeCategory[] = ["faq", "catalog", "policy", "script"];
 const LANGUAGES: KnowledgeLanguage[] = ["uz", "ru", "en"];
@@ -33,6 +34,18 @@ function isUpcoming(item: KnowledgeItem): boolean {
 }
 
 export default function KnowledgePage() {
+  // useWorkspace() must be called from a descendant of the WorkspaceProvider
+  // AppShell mounts — this page renders AppShell itself, so the actual body
+  // lives in KnowledgePageInner, rendered as AppShell's child.
+  return (
+    <AppShell>
+      <KnowledgePageInner />
+    </AppShell>
+  );
+}
+
+function KnowledgePageInner() {
+  const { apiFetch, activeWorkspace, loading: workspaceLoading, error: workspaceError } = useWorkspace();
   const [items, setItems] = useState<KnowledgeItem[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -46,6 +59,7 @@ export default function KnowledgePage() {
   const [busyId, setBusyId] = useState<string | null>(null);
 
   const load = useCallback(async () => {
+    if (!activeWorkspace) return;
     setLoading(true);
     setError(null);
     try {
@@ -54,7 +68,7 @@ export default function KnowledgePage() {
       if (language) params.set("language", language);
       if (approval) params.set("isApproved", approval);
 
-      const res = await fetch(`/api/knowledge?${params.toString()}`);
+      const res = await apiFetch(`/api/knowledge?${params.toString()}`);
       const body = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(body?.error || "Failed to load knowledge items");
       setItems(body.items ?? []);
@@ -63,11 +77,11 @@ export default function KnowledgePage() {
     } finally {
       setLoading(false);
     }
-  }, [category, language, approval]);
+  }, [category, language, approval, apiFetch, activeWorkspace]);
 
   useEffect(() => {
-    load();
-  }, [load]);
+    if (activeWorkspace) load();
+  }, [load, activeWorkspace]);
 
   const openCreate = () => {
     setEditingItem(null);
@@ -82,7 +96,7 @@ export default function KnowledgePage() {
   const toggleApproval = async (item: KnowledgeItem) => {
     setBusyId(item.id);
     try {
-      const res = await fetch(`/api/knowledge/${item.id}/approve`, {
+      const res = await apiFetch(`/api/knowledge/${item.id}/approve`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ isApproved: !item.is_approved }),
@@ -97,8 +111,26 @@ export default function KnowledgePage() {
     }
   };
 
+  if (workspaceLoading) {
+    return <SkeletonList rows={6} />;
+  }
+
+  if (workspaceError) {
+    return <ErrorState title="Couldn't load your workspace" message={workspaceError} />;
+  }
+
+  if (!activeWorkspace) {
+    return (
+      <EmptyState
+        icon={BookOpen}
+        title="No workspace selected"
+        message="Select a workspace to manage its knowledge base."
+      />
+    );
+  }
+
   return (
-    <AppShell>
+    <>
       <div className="space-y-6">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
@@ -258,6 +290,6 @@ export default function KnowledgePage() {
           load();
         }}
       />
-    </AppShell>
+    </>
   );
 }
