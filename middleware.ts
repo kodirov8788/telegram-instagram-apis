@@ -2,23 +2,31 @@ import { NextResponse, type NextRequest } from 'next/server';
 import { createSupabaseServerClient } from '@/lib/supabase/server';
 
 /**
- * Public page paths that must never be gated by the auth/workspace redirect
- * below — the pages themselves don't exist yet for some of these (UI-03,
- * #92, builds them), but the redirect *targets* must already resolve here.
+ * Auth-only page paths (no workspace requirement to reach them) — used
+ * to decide the "already authenticated, don't show me the login form"
+ * redirect. `/onboarding` is deliberately NOT in this list: an
+ * authenticated user with an existing workspace can still visit it to
+ * create another one, so it isn't gated away like `/login`/`/signup` are.
  * `/api/*` is handled separately (see `isApiPath`): every API route already
  * enforces its own auth via `authenticate()` / `withLiveAuthorization`
  * (`src/lib/auth/session.ts`), which remains the real source of truth for
  * tenant access — this middleware redirect is a page-navigation UX
  * convenience only, not a security boundary.
  */
-const PUBLIC_PAGE_PATHS = ['/login', '/signup', '/onboarding'];
+const AUTH_ONLY_PAGE_PATHS = ['/login', '/signup'];
+const ONBOARDING_PATH = '/onboarding';
+const DEFAULT_AUTHENTICATED_LANDING = '/inbox';
 
 function isApiPath(pathname: string) {
   return pathname.startsWith('/api/');
 }
 
-function isPublicPagePath(pathname: string) {
-  return PUBLIC_PAGE_PATHS.some(p => pathname === p || pathname.startsWith(`${p}/`));
+function isAuthOnlyPagePath(pathname: string) {
+  return AUTH_ONLY_PAGE_PATHS.some(p => pathname === p || pathname.startsWith(`${p}/`));
+}
+
+function isOnboardingPath(pathname: string) {
+  return pathname === ONBOARDING_PATH || pathname.startsWith(`${ONBOARDING_PATH}/`);
 }
 
 /**
@@ -39,19 +47,22 @@ function redirectPreservingRefreshedCookies(url: URL, refreshedResponse: NextRes
 }
 
 /**
- * AUTH-04 (#87) route protection.
+ * AUTH-04 (#87) route protection, extended in UI-03 (#92) to also redirect
+ * an already-authenticated visitor away from `/login`/`/signup`.
  *
- * Extends AUTH-02's refresh-only middleware with page-level redirects:
- *  - unauthenticated                -> `/login`
- *  - authenticated, zero workspaces -> `/onboarding`
- *  - authenticated, has workspace(s) -> pass through
+ *  - unauthenticated, protected route        -> `/login?redirect=<path>`
+ *  - unauthenticated, `/login` or `/signup`   -> pass through (that's where they belong)
+ *  - authenticated, `/login` or `/signup`     -> redirect into the app (workspace-aware)
+ *  - authenticated, zero workspaces           -> `/onboarding` (except `/onboarding` itself)
+ *  - authenticated, has workspace(s)          -> pass through
  *
  * Workspace membership is discovered by calling this app's own
  * `GET /api/workspaces` (forwarding the request's cookies) rather than
  * querying Postgres directly — middleware runs on the Edge runtime, which
  * cannot use the `pg` connection pool the rest of the app relies on, and
  * `/api/workspaces` already implements the exact tenant-safe membership
- * check this redirect needs.
+ * check this redirect needs. It is also how this middleware learns whether
+ * the visitor is authenticated at all (a 401 from that route = no session).
  */
 export async function middleware(request: NextRequest) {
   const response = NextResponse.next({ request });
@@ -65,7 +76,7 @@ export async function middleware(request: NextRequest) {
 
   const { pathname } = request.nextUrl;
 
-  if (isApiPath(pathname) || isPublicPagePath(pathname)) {
+  if (isApiPath(pathname)) {
     return response;
   }
 
@@ -80,6 +91,9 @@ export async function middleware(request: NextRequest) {
       headers: { cookie: forwardedCookie },
     });
     if (workspacesRes.status === 401) {
+      // Unauthenticated: /login and /signup are exactly where they should
+      // be; everything else redirects there, preserving the intended path.
+      if (isAuthOnlyPagePath(pathname)) return response;
       const loginUrl = new URL('/login', request.url);
       loginUrl.searchParams.set('redirect', pathname);
       return redirectPreservingRefreshedCookies(loginUrl, response);
@@ -96,8 +110,19 @@ export async function middleware(request: NextRequest) {
     return response;
   }
 
-  if (workspaceCount === 0) {
-    return redirectPreservingRefreshedCookies(new URL('/onboarding', request.url), response);
+  // Authenticated from here on.
+
+  if (isAuthOnlyPagePath(pathname)) {
+    // Already signed in — /login and /signup have nothing left to offer.
+    const destination = new URL(
+      workspaceCount === 0 ? ONBOARDING_PATH : DEFAULT_AUTHENTICATED_LANDING,
+      request.url
+    );
+    return redirectPreservingRefreshedCookies(destination, response);
+  }
+
+  if (workspaceCount === 0 && !isOnboardingPath(pathname)) {
+    return redirectPreservingRefreshedCookies(new URL(ONBOARDING_PATH, request.url), response);
   }
 
   return response;
