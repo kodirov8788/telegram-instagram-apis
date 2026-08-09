@@ -1,6 +1,7 @@
 'use client';
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react';
+import { readStoredWorkspaceId, writeStoredWorkspaceId } from './storage';
 
 export interface WorkspaceSummary {
   id: string;
@@ -18,28 +19,7 @@ export interface WorkspaceContextValue {
   apiFetch: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 }
 
-const STORAGE_KEY = 'ydeck.activeWorkspaceId';
-
 const WorkspaceContext = createContext<WorkspaceContextValue | null>(null);
-
-function readStoredWorkspaceId(): string | null {
-  if (typeof window === 'undefined') return null;
-  try {
-    return window.localStorage.getItem(STORAGE_KEY);
-  } catch {
-    return null;
-  }
-}
-
-function writeStoredWorkspaceId(id: string | null) {
-  if (typeof window === 'undefined') return;
-  try {
-    if (id) window.localStorage.setItem(STORAGE_KEY, id);
-    else window.localStorage.removeItem(STORAGE_KEY);
-  } catch {
-    // Storage unavailable (private mode, disabled, etc.) — fall back to in-memory only.
-  }
-}
 
 /**
  * WorkspaceProvider — the single shared client mechanism for workspace
