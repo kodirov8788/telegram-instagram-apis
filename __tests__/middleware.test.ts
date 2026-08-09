@@ -103,4 +103,29 @@ describe('middleware — API and infra paths', () => {
     const res = await middleware(req('/inbox'));
     expect(res.headers.get('location')).toBeNull();
   });
+
+  it('fails open (passes through, does not redirect) on an unexpected non-401/non-ok status from /api/workspaces', async () => {
+    // Regression test: previously an unhandled status (e.g. 500) left
+    // workspaceCount as `null`, which is neither 0 nor a real count, so
+    // the zero-workspace redirect check (`workspaceCount === 0`) silently
+    // never fired and the request fell through as if everything were fine
+    // — an ambiguous state, not an explicit decision either way.
+    mockWorkspacesResponse(500);
+    const res = await middleware(req('/inbox'));
+    expect(res.headers.get('location')).toBeNull();
+  });
+});
+
+describe('middleware — cache-control', () => {
+  it('sets no-store Cache-Control on a pass-through response', async () => {
+    mockWorkspacesResponse(200, { workspaces: [{ id: 'w1', name: 'Acme', role: 'owner' }] });
+    const res = await middleware(req('/inbox'));
+    expect(res.headers.get('cache-control')).toContain('no-store');
+  });
+
+  it('sets no-store Cache-Control on a redirect response', async () => {
+    mockWorkspacesResponse(401);
+    const res = await middleware(req('/inbox'));
+    expect(res.headers.get('cache-control')).toContain('no-store');
+  });
 });

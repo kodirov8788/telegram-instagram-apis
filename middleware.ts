@@ -43,6 +43,10 @@ function redirectPreservingRefreshedCookies(url: URL, refreshedResponse: NextRes
   const redirectResponse = NextResponse.redirect(url);
   const setCookie = refreshedResponse.headers.get('set-cookie');
   if (setCookie) redirectResponse.headers.set('set-cookie', setCookie);
+  // Same reasoning as the pass-through response — see the comment where
+  // Cache-Control is first set in middleware(). A cached redirect would be
+  // just as wrong to replay as a cached pass-through.
+  redirectResponse.headers.set('Cache-Control', 'private, no-store, must-revalidate');
   return redirectResponse;
 }
 
@@ -66,6 +70,12 @@ function redirectPreservingRefreshedCookies(url: URL, refreshedResponse: NextRes
  */
 export async function middleware(request: NextRequest) {
   const response = NextResponse.next({ request });
+  // Every decision this middleware makes depends on the caller's own auth
+  // session and current workspace membership — never let Vercel's edge CDN
+  // cache a response (redirect or pass-through) and replay it for a
+  // different visitor or a later, different-state request from the same
+  // one. Applies to every response path below (pass-through and redirect).
+  response.headers.set('Cache-Control', 'private, no-store, must-revalidate');
 
   if (process.env.NEXT_PUBLIC_SUPABASE_URL && process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY) {
     const supabase = createSupabaseServerClient(request, response);
@@ -101,6 +111,15 @@ export async function middleware(request: NextRequest) {
     if (workspacesRes.ok) {
       const data = (await workspacesRes.json()) as { workspaces: unknown[] };
       workspaceCount = data.workspaces?.length ?? 0;
+    } else {
+      // Any other status (500, unexpected 403, etc.) — previously left
+      // workspaceCount as null, which is neither 0 nor a real count, so
+      // the checks below silently fell through to pass-through instead of
+      // a safe, explicit decision. Fail open the same way a network error
+      // does: this is a UX redirect only, and every real data-fetching
+      // request on the destination page still goes through
+      // withLiveAuthorization, which is the actual enforcement point.
+      return response;
     }
   } catch {
     // If the workspace-discovery call itself fails (network/infra hiccup),
