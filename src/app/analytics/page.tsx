@@ -12,6 +12,7 @@ import {
 } from 'lucide-react';
 import { Card, CardHeader, CardTitle, CardContent, Badge, type BadgeTone } from '@/components/ui';
 import { AppShell, Skeleton, ErrorState, EmptyState } from '@/components/shell';
+import { useWorkspace } from '@/lib/workspace/context';
 
 type StatusCounts = Record<string, number>;
 
@@ -61,6 +62,18 @@ interface KpiCardData {
 }
 
 export default function AnalyticsPage() {
+  // useWorkspace() must be called from a descendant of the WorkspaceProvider
+  // AppShell mounts — this page renders AppShell itself, so the actual body
+  // lives in AnalyticsPageInner, rendered as AppShell's child.
+  return (
+    <AppShell>
+      <AnalyticsPageInner />
+    </AppShell>
+  );
+}
+
+function AnalyticsPageInner() {
+  const { apiFetch, activeWorkspace, loading: workspaceLoading, error: workspaceError } = useWorkspace();
   const [metrics, setMetrics] = useState<MetricsResponse | null>(null);
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [leadCount, setLeadCount] = useState<number | null>(null);
@@ -68,13 +81,14 @@ export default function AnalyticsPage() {
   const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
+    if (!activeWorkspace) return;
     setLoading(true);
     setError(null);
     try {
       const [metricsRes, healthRes, leadsRes] = await Promise.all([
-        fetch('/api/observability/metrics', { credentials: 'include' }),
-        fetch('/api/observability/health', { credentials: 'include' }),
-        fetch('/api/leads', { credentials: 'include' }),
+        apiFetch('/api/observability/metrics'),
+        apiFetch('/api/observability/health'),
+        apiFetch('/api/leads'),
       ]);
 
       if (!metricsRes.ok) throw new Error(`Failed to load metrics (${metricsRes.status})`);
@@ -97,11 +111,11 @@ export default function AnalyticsPage() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [apiFetch, activeWorkspace]);
 
   useEffect(() => {
-    load();
-  }, [load]);
+    if (activeWorkspace) load();
+  }, [load, activeWorkspace]);
 
   const totalInbound = metrics
     ? Object.values(metrics.inbound).reduce((sum, n) => sum + n, 0)
@@ -160,8 +174,37 @@ export default function AnalyticsPage() {
     });
   }
 
+  if (workspaceLoading) {
+    return (
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+        {Array.from({ length: 4 }).map((_, idx) => (
+          <Card key={idx}>
+            <CardContent className="space-y-3 py-6">
+              <Skeleton className="h-3 w-24" />
+              <Skeleton className="h-8 w-16" />
+            </CardContent>
+          </Card>
+        ))}
+      </div>
+    );
+  }
+
+  if (workspaceError) {
+    return <ErrorState message={workspaceError} />;
+  }
+
+  if (!activeWorkspace) {
+    return (
+      <EmptyState
+        icon={BarChart3}
+        title="No workspace selected"
+        message="Select a workspace to view its analytics."
+      />
+    );
+  }
+
   return (
-    <AppShell>
+    <>
       <div className="flex items-center justify-between mb-6 gap-4 flex-wrap">
         <div>
           <h1 className="text-2xl font-bold text-foreground">Analytics & Performance</h1>
@@ -170,8 +213,11 @@ export default function AnalyticsPage() {
           </p>
         </div>
 
+        {/* A plain <a> download navigation can't attach the x-workspace-id
+            header, so the workspace id is passed as a query param instead —
+            accepted by selectedWorkspace()'s fallback (header ?? workspace_id ?? id). */}
         <a
-          href="/api/leads/export"
+          href={`/api/leads/export?workspace_id=${activeWorkspace.id}`}
           download
           className="flex items-center gap-2 px-4 py-2.5 rounded-lg bg-brand-600 hover:bg-brand-500 text-white font-medium text-sm transition shadow-card"
         >
@@ -244,7 +290,7 @@ export default function AnalyticsPage() {
           </div>
         </>
       ) : null}
-    </AppShell>
+    </>
   );
 }
 
