@@ -19,17 +19,52 @@ export interface DialogProps {
  * role="dialog"/aria-modal for basic screen-reader support.
  * Usage: <Dialog open={isOpen} onClose={() => setOpen(false)} title="Confirm">...</Dialog>
  */
+function getFocusable(container: HTMLElement): HTMLElement[] {
+  return Array.from(
+    container.querySelectorAll<HTMLElement>(
+      'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+    )
+  );
+}
+
 export function Dialog({ open, onClose, title, description, children, className }: DialogProps) {
   const panelRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
     if (!open) return;
+    // Remember what had focus so it can be restored on close.
+    triggerRef.current = document.activeElement as HTMLElement | null;
+
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape") {
+        onClose();
+        return;
+      }
+      if (e.key !== "Tab" || !panelRef.current) return;
+      // Basic focus trap: keep Tab/Shift+Tab cycling within the dialog.
+      const focusable = getFocusable(panelRef.current);
+      if (focusable.length === 0) {
+        e.preventDefault();
+        return;
+      }
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      }
     };
     document.addEventListener("keydown", onKeyDown);
     panelRef.current?.focus();
-    return () => document.removeEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("keydown", onKeyDown);
+      // Restore focus to whatever opened the dialog.
+      triggerRef.current?.focus();
+    };
   }, [open, onClose]);
 
   if (!open || typeof document === "undefined") return null;
@@ -50,7 +85,8 @@ export function Dialog({ open, onClose, title, description, children, className 
         tabIndex={-1}
         className={cn(
           "relative z-10 w-full max-w-md rounded-lg border border-border bg-background p-5 shadow-card",
-          "focus:outline-none",
+          "max-h-[90vh] overflow-y-auto",
+          "focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500",
           className
         )}
       >
