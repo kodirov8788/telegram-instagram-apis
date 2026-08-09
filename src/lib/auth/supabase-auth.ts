@@ -1,5 +1,6 @@
 import type { Session, User } from '@supabase/supabase-js';
 import { createClient } from '@/lib/supabase/client';
+import { clearStoredActiveWorkspace } from '@/lib/workspace/storage';
 
 /**
  * Client-safe email/password auth wrappers around Supabase Auth
@@ -91,5 +92,9 @@ export async function signInWithPassword(email: string, password: string): Promi
 export async function signOut(): Promise<void> {
   const supabase = createClient();
   const { error } = await supabase.auth.signOut();
+  // Clear the stored active-workspace id regardless of outcome — a failed
+  // signOut still means this browser should not silently carry the
+  // previous session's workspace selection forward.
+  clearStoredActiveWorkspace();
   if (error) throw toAuthError(error);
 }
