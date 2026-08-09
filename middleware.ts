@@ -2,19 +2,56 @@ import { NextResponse, type NextRequest } from 'next/server';
 import { createSupabaseServerClient } from '@/lib/supabase/server';
 
 /**
- * AUTH-02 scope: session refresh ONLY.
+ * Public page paths that must never be gated by the auth/workspace redirect
+ * below — the pages themselves don't exist yet for some of these (UI-03,
+ * #92, builds them), but the redirect *targets* must already resolve here.
+ * `/api/*` is handled separately (see `isApiPath`): every API route already
+ * enforces its own auth via `authenticate()` / `withLiveAuthorization`
+ * (`src/lib/auth/session.ts`), which remains the real source of truth for
+ * tenant access — this middleware redirect is a page-navigation UX
+ * convenience only, not a security boundary.
+ */
+const PUBLIC_PAGE_PATHS = ['/login', '/signup', '/onboarding'];
+
+function isApiPath(pathname: string) {
+  return pathname.startsWith('/api/');
+}
+
+function isPublicPagePath(pathname: string) {
+  return PUBLIC_PAGE_PATHS.some(p => pathname === p || pathname.startsWith(`${p}/`));
+}
+
+/**
+ * `NextResponse.redirect(url)` builds a brand-new response object — it does
+ * NOT carry over any `Set-Cookie` header the earlier `supabase.auth.getUser()`
+ * call may have written onto `response` (e.g. a rotated refresh token). Per
+ * independent review of #109: without this, a token rotation that happened
+ * on this exact request would be silently dropped on the /login and
+ * /onboarding redirect paths, leaving the client with its old, soon-to-expire
+ * cookie. Copying the header across preserves the refresh regardless of
+ * which response path this request takes.
+ */
+function redirectPreservingRefreshedCookies(url: URL, refreshedResponse: NextResponse) {
+  const redirectResponse = NextResponse.redirect(url);
+  const setCookie = refreshedResponse.headers.get('set-cookie');
+  if (setCookie) redirectResponse.headers.set('set-cookie', setCookie);
+  return redirectResponse;
+}
+
+/**
+ * AUTH-04 (#87) route protection.
  *
- * Calling `supabase.auth.getUser()` here lets `@supabase/ssr` rotate an
- * expiring refresh token and rewrite the updated auth cookies onto the
- * outgoing response, so API routes see a live session on the next request
- * instead of intermittently falling back to the legacy path (or 401ing)
- * once the access token expires.
+ * Extends AUTH-02's refresh-only middleware with page-level redirects:
+ *  - unauthenticated                -> `/login`
+ *  - authenticated, zero workspaces -> `/onboarding`
+ *  - authenticated, has workspace(s) -> pass through
  *
- * This middleware does NOT redirect, block, or otherwise gate any route —
- * every request passes through unchanged except for its cookies. Route
- * protection / redirects are explicitly AUTH-04's job (#87); this file is
- * intentionally structured so that logic can be added here later without a
- * rewrite (see the TODO below).
+ * Workspace membership is discovered by calling this app's own
+ * `GET /api/workspaces` (forwarding the request's cookies) rather than
+ * querying Postgres directly — middleware runs on the Edge runtime, which
+ * cannot use the `pg` connection pool the rest of the app relies on, and
+ * `/api/workspaces` already implements the exact tenant-safe membership
+ * check this redirect needs.
  */
 export async function middleware(request: NextRequest) {
   const response = NextResponse.next({ request });
@@ -26,8 +63,42 @@ export async function middleware(request: NextRequest) {
     await supabase.auth.getUser();
   }
 
-  // TODO(AUTH-04, #87): add route-protection / redirect logic here, using the
-  // already-resolved session above. Do not add it before that issue.
+  const { pathname } = request.nextUrl;
+
+  if (isApiPath(pathname) || isPublicPagePath(pathname)) {
+    return response;
+  }
+
+  const cookieHeader = request.headers.get('cookie') ?? '';
+  // Forward the (possibly just-refreshed) auth cookies onto the internal
+  // call so it observes the same session this request will.
+  const forwardedCookie = response.headers.get('set-cookie') ? request.cookies.toString() : cookieHeader;
+
+  let workspaceCount: number | null = null;
+  try {
+    const workspacesRes = await fetch(new URL('/api/workspaces', request.url), {
+      headers: { cookie: forwardedCookie },
+    });
+    if (workspacesRes.status === 401) {
+      const loginUrl = new URL('/login', request.url);
+      loginUrl.searchParams.set('redirect', pathname);
+      return redirectPreservingRefreshedCookies(loginUrl, response);
+    }
+    if (workspacesRes.ok) {
+      const data = (await workspacesRes.json()) as { workspaces: unknown[] };
+      workspaceCount = data.workspaces?.length ?? 0;
+    }
+  } catch {
+    // If the workspace-discovery call itself fails (network/infra hiccup),
+    // fail open on this UX redirect rather than locking users out of pages
+    // whose data-fetching will surface the real error anyway — server-side
+    // authorization on every API call remains the actual enforcement point.
+    return response;
+  }
+
+  if (workspaceCount === 0) {
+    return redirectPreservingRefreshedCookies(new URL('/onboarding', request.url), response);
+  }
 
   return response;
 }
