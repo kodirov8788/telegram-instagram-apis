@@ -5,7 +5,8 @@ export type Permission =
   | 'conversation:read' | 'conversation:update'
   | 'leads:export' | 'leads:read'
   | 'members:read' | 'members:invite' | 'members:update' | 'members:remove'
-  | 'knowledge:read' | 'knowledge:write';
+  | 'knowledge:read' | 'knowledge:write'
+  | 'connections:read' | 'connections:write';
 
 const permissions: Record<Permission, readonly Role[]> = {
   'workspace:read': roles,
@@ -20,6 +21,13 @@ const permissions: Record<Permission, readonly Role[]> = {
   'members:remove': ['owner', 'admin'],
   'knowledge:read': roles,
   'knowledge:write': ['owner', 'admin', 'sales_manager', 'support_operator'],
+  // Connections carry per-tenant provider credentials (vault-backed). Read
+  // is scoped narrower than knowledge:read (no non-secret-shaped health
+  // summary is worth exposing to every role) and write/test are owner+admin
+  // only, since write can rotate credentials and test makes a live provider
+  // call using them.
+  'connections:read': ['owner', 'admin', 'sales_manager', 'support_operator'],
+  'connections:write': ['owner', 'admin'],
 };
 
 export function can(role: string, permission: Permission): role is Role {
