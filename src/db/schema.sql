@@ -22,11 +22,14 @@ CREATE TABLE IF NOT EXISTS workspaces (
 -- 3. Users & Workspace Memberships (RBAC)
 DO $$ BEGIN CREATE TYPE user_role AS ENUM ('owner', 'admin', 'sales_manager', 'sales_representative', 'support_operator', 'read_only_analyst'); EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
+-- `id` intentionally has no default here (AUTH-01): rows are created only via
+-- the sync_auth_user_to_public_users_trigger on auth.users, with id copied
+-- 1:1 from auth.users.id. `password_hash` was removed in AUTH-05 — identity
+-- and credentials are owned entirely by Supabase Auth now.
 CREATE TABLE IF NOT EXISTS users (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    id UUID PRIMARY KEY,
     email VARCHAR(255) UNIQUE NOT NULL,
     full_name VARCHAR(255) NOT NULL,
-    password_hash VARCHAR(255),
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
@@ -39,14 +42,8 @@ CREATE TABLE IF NOT EXISTS workspace_members (
     UNIQUE(workspace_id, user_id)
 );
 
-CREATE TABLE IF NOT EXISTS user_sessions (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    token_hash CHAR(64) UNIQUE NOT NULL,
-    expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
-    revoked_at TIMESTAMP WITH TIME ZONE,
-    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
-);
+-- `user_sessions` (the legacy bcrypt/cookie session table) was dropped in
+-- AUTH-05 — see src/db/migrations/021_remove_legacy_auth.sql.
 
 CREATE TABLE IF NOT EXISTS workspace_invitations (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -206,7 +203,6 @@ CREATE UNIQUE INDEX IF NOT EXISTS customers_connection_provider_identity_unique 
 CREATE UNIQUE INDEX IF NOT EXISTS conversations_one_active_connection_customer ON conversations(workspace_id,connection_id,customer_id,channel) WHERE connection_id IS NOT NULL AND status IN ('new','ai_handling','waiting_for_customer','human_attention_required','human_handling','qualified_lead');
 CREATE INDEX IF NOT EXISTS idx_leads_workspace_status ON leads(workspace_id, status);
 CREATE INDEX IF NOT EXISTS idx_knowledge_items_workspace ON knowledge_items(workspace_id);
-CREATE INDEX IF NOT EXISTS idx_user_sessions_user ON user_sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_workspace_invitations_workspace ON workspace_invitations(workspace_id);
 CREATE UNIQUE INDEX IF NOT EXISTS workspace_invitations_one_live_email ON workspace_invitations(workspace_id, lower(email)) WHERE accepted_at IS NULL;
 

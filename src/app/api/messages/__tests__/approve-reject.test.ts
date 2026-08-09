@@ -8,6 +8,10 @@ vi.mock('@/lib/db', () => ({
   default: { connect: vi.fn() },
 }));
 vi.mock('@/lib/services/audit-log', () => ({ AuditLogService: { logEvent: vi.fn() } }));
+vi.mock('@/lib/supabase/server', async () => {
+  const m = await import('@/lib/auth/__tests__/supabase-session-mock');
+  return { createSupabaseServerClient: m.mockCreateSupabaseServerClient };
+});
 
 const mocks = vi.hoisted(() => {
   class MockDuplicateActiveJobError extends Error {}
@@ -28,6 +32,7 @@ import { query } from '@/lib/db';
 import { AuditLogService } from '@/lib/services/audit-log';
 import { POST as approve } from '../[messageId]/approve/route';
 import { POST as reject } from '../[messageId]/reject/route';
+import { setMockSupabaseUser } from '@/lib/auth/__tests__/supabase-session-mock';
 
 const db = vi.mocked(query);
 const audit = vi.mocked(AuditLogService.logEvent);
@@ -35,12 +40,11 @@ const audit = vi.mocked(AuditLogService.logEvent);
 const wid = '11111111-1111-4111-8111-111111111111';
 const mid = '22222222-2222-4222-8222-222222222222';
 const uid = 'user-1';
-const headers = { cookie: `session=${'a'.repeat(64)}`, 'x-workspace-id': wid, 'content-type': 'application/json' };
+const headers = { 'x-workspace-id': wid, 'content-type': 'application/json' };
 
 const ctx = { params: Promise.resolve({ messageId: mid }) };
 const req = (url: string, body?: object) => new NextRequest(url, { headers, ...(body ? { method: 'POST', body: JSON.stringify(body) } : { method: 'POST' }) });
 
-const session = () => db.mockResolvedValueOnce({ rows: [{ user_id: uid, email: 'u@test.dev' }] } as never);
 const member = (role = 'support_operator') => db.mockResolvedValueOnce({ rows: [{ role }] } as never);
 const claimRow = () =>
   db.mockResolvedValueOnce({
@@ -57,11 +61,11 @@ beforeEach(() => {
   createJob.mockResolvedValue({ id: 'job-1' });
   enqueueOutboundJob.mockClear();
   enqueueOutboundJob.mockResolvedValue(undefined);
+  setMockSupabaseUser({ id: uid, email: 'u@test.dev' });
 });
 
 describe('POST /api/messages/:id/approve', () => {
   it('approves a pending draft, creates exactly one outbound job in the same transaction as the claim, and audit-logs it', async () => {
-    session();
     member();
     claimRow(); // atomic claim UPDATE, commits 'approved' before job creation is attempted
     db.mockResolvedValueOnce({ rows: [] } as never); // SAVEPOINT job_creation
@@ -86,7 +90,6 @@ describe('POST /api/messages/:id/approve', () => {
   });
 
   it('rolls back the whole transaction (approval included) if job creation fails for a reason other than a duplicate', async () => {
-    session();
     member();
     claimRow();
     db.mockResolvedValueOnce({ rows: [] } as never); // SAVEPOINT job_creation
@@ -104,7 +107,6 @@ describe('POST /api/messages/:id/approve', () => {
   });
 
   it('keeps the approval but skips job creation when createJob reports a duplicate active job (concurrent approval race)', async () => {
-    session();
     member();
     claimRow();
     db.mockResolvedValueOnce({ rows: [] } as never); // SAVEPOINT job_creation
@@ -123,7 +125,6 @@ describe('POST /api/messages/:id/approve', () => {
   });
 
   it('rejects a duplicate/concurrent approve of the same message (already-resolved row matches 0 rows)', async () => {
-    session();
     member();
     db.mockResolvedValueOnce({ rows: [] } as never); // atomic UPDATE matched nothing — already approved by a concurrent caller
     db.mockResolvedValueOnce({ rows: [{ delivery_status: 'sent' }] } as never); // probe for the error message
@@ -135,7 +136,6 @@ describe('POST /api/messages/:id/approve', () => {
   });
 
   it('rejects approving a draft whose conversation has moved to human mode', async () => {
-    session();
     member();
     db.mockResolvedValueOnce({ rows: [] } as never); // atomic UPDATE excluded it via c.mode <> 'human'
     db.mockResolvedValueOnce({ rows: [{ delivery_status: 'pending_approval', mode: 'human' }] } as never);
@@ -147,7 +147,6 @@ describe('POST /api/messages/:id/approve', () => {
   });
 
   it('returns 404 for a message that does not exist in this workspace', async () => {
-    session();
     member();
     db.mockResolvedValueOnce({ rows: [] } as never);
     db.mockResolvedValueOnce({ rows: [] } as never); // probe finds nothing either — cross-tenant or nonexistent
@@ -159,7 +158,6 @@ describe('POST /api/messages/:id/approve', () => {
 
 describe('POST /api/messages/:id/reject', () => {
   it('rejects a pending draft with a reason and never creates a job', async () => {
-    session();
     member();
     db.mockResolvedValueOnce({ rows: [{ id: mid, conversation_id: 'conv-1' }] } as never);
 
@@ -172,7 +170,6 @@ describe('POST /api/messages/:id/reject', () => {
   });
 
   it('rejects a duplicate/concurrent reject of the same message', async () => {
-    session();
     member();
     db.mockResolvedValueOnce({ rows: [] } as never);
     db.mockResolvedValueOnce({ rows: [{ delivery_status: 'rejected' }] } as never);

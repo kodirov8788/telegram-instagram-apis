@@ -1,23 +1,11 @@
-import { createHash, randomBytes } from 'node:crypto';
 import type { NextRequest } from 'next/server';
 import { query, tenantTransaction, type DbClient } from '@/lib/db';
 import { createSupabaseServerClient } from '@/lib/supabase/server';
 import { can, type Permission, type Role } from './permissions';
 import { HttpError, uuid } from '../http/validation';
 
-export const SESSION_COOKIE = 'session';
-export const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
-const hash = (token: string) => createHash('sha256').update(token).digest('hex');
-
 export interface Principal { userId: string; email: string; }
 export interface WorkspacePrincipal extends Principal { workspaceId: string; role: Role; }
-
-export async function createSession(userId: string, client: DbClient = { query }) {
-  const token = randomBytes(32).toString('hex');
-  const expiresAt = new Date(Date.now() + SESSION_TTL_MS);
-  await client.query('INSERT INTO user_sessions (user_id, token_hash, expires_at) VALUES ($1, $2, $3)', [userId, hash(token), expiresAt]);
-  return { token, expiresAt };
-}
 
 /**
  * Resolve the current Supabase Auth session, if any. Uses `getUser()` rather
@@ -39,30 +27,11 @@ async function authenticateViaSupabase(request: NextRequest): Promise<Principal 
   }
 }
 
-/** Legacy custom-cookie session lookup (pre-Supabase-Auth). Retained until AUTH-05. */
-async function authenticateViaLegacyCookie(request: NextRequest, client: DbClient): Promise<Principal> {
-  const token = request.cookies.get(SESSION_COOKIE)?.value;
-  if (!token) throw new HttpError(401, 'Authentication required');
-  const result = await client.query(
-    `SELECT s.user_id, u.email FROM user_sessions s JOIN users u ON u.id = s.user_id
-     WHERE s.token_hash = $1 AND s.revoked_at IS NULL AND s.expires_at > NOW()`, [hash(token)]);
-  const row = result.rows[0];
-  if (!row) throw new HttpError(401, 'Invalid or expired session');
-  return { userId: row.user_id, email: row.email };
-}
-
-/**
- * Resolve the calling principal. Tries a Supabase Auth session first (the
- * AUTH-02+ path); if none is present, falls back to the legacy custom-cookie
- * `user_sessions` lookup so pre-existing (theoretical, zero-production-user)
- * flows keep working until AUTH-05 removes them. Both paths return the same
- * `Principal` shape, so every downstream call site (`authorize`,
- * `withLiveAuthorization`, and every route handler) is unaffected.
- */
-export async function authenticate(request: NextRequest, client: DbClient = { query }): Promise<Principal> {
-  const supabasePrincipal = await authenticateViaSupabase(request);
-  if (supabasePrincipal) return supabasePrincipal;
-  return authenticateViaLegacyCookie(request, client);
+/** Resolve the calling principal from the Supabase Auth session (AUTH-05: legacy cookie auth removed). */
+export async function authenticate(request: NextRequest): Promise<Principal> {
+  const principal = await authenticateViaSupabase(request);
+  if (!principal) throw new HttpError(401, 'Authentication required');
+  return principal;
 }
 
 export function selectedWorkspace(request: NextRequest): string {
@@ -99,10 +68,3 @@ export async function withLiveAuthorization<T>(
     return operation({ ...principal, workspaceId, role }, client);
   });
 }
-
-export async function revokeSession(request: NextRequest) {
-  const token = request.cookies.get(SESSION_COOKIE)?.value;
-  if (token) await query('UPDATE user_sessions SET revoked_at = NOW() WHERE token_hash = $1', [hash(token)]);
-}
-
-export const cookieOptions = (expires?: Date) => ({ httpOnly: true, secure: true, sameSite: 'lax' as const, path: '/', ...(expires ? { expires } : {}) });
