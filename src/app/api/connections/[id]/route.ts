@@ -79,7 +79,20 @@ export async function DELETE(req: NextRequest, ctx: { params: Promise<{ id: stri
     const id = await target(ctx);
 
     await withLiveAuthorization(req, 'connections:write', async (p, client) => {
-      const deleted = await ConnectionsService.deleteConnection(p.workspaceId, id, client);
+      let deleted: boolean;
+      try {
+        deleted = await ConnectionsService.deleteConnection(p.workspaceId, id, client);
+      } catch (error: any) {
+        // 23503 = foreign_key_violation. channel_connections is referenced
+        // by customers/conversations/provider_events/outbound_jobs with
+        // ON DELETE RESTRICT (by design — a connection with real history
+        // must not be silently hard-deleted). Surface this as a clear 409
+        // instead of letting a raw DB error fall through to a bare 500.
+        if (error?.code === '23503') {
+          throw new HttpError(409, 'Connection is in use and cannot be deleted; deactivate it instead');
+        }
+        throw error;
+      }
       if (!deleted) throw new HttpError(404, 'Connection not found');
       await AuditLogService.logEvent({
         workspaceId: p.workspaceId,

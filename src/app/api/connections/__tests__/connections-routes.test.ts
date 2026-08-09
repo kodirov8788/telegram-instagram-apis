@@ -200,6 +200,17 @@ describe('DELETE /api/connections/:id', () => {
     expect(db.mock.calls[2][1]).toEqual([cid, wid]);
     expect(audit).toHaveBeenCalledWith(expect.objectContaining({ action: 'connection.deleted' }));
   });
+
+  it('returns 409 (not a raw 500) when the connection has referencing rows (FK RESTRICT)', async () => {
+    session(); member('owner');
+    const fkError = Object.assign(new Error('update or delete on table "channel_connections" violates foreign key constraint'), { code: '23503' });
+    db.mockRejectedValueOnce(fkError);
+    const res = await connDelete(new NextRequest(`https://app.test/api/connections/${cid}`, { method: 'DELETE', headers }), ctx);
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.error).toMatch(/in use/i);
+    expect(audit).not.toHaveBeenCalled();
+  });
 });
 
 describe('POST /api/connections/:id/test', () => {
