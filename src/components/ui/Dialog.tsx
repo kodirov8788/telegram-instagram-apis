@@ -30,6 +30,13 @@ function getFocusable(container: HTMLElement): HTMLElement[] {
 export function Dialog({ open, onClose, title, description, children, className }: DialogProps) {
   const panelRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLElement | null>(null);
+  // Callers commonly pass an inline `onClose` arrow function, which gets a
+  // new identity on every parent render — including renders caused by state
+  // unrelated to this dialog. Reading it through a ref (rather than putting
+  // it in the effect's dependency array) keeps the focus-trap/restore effect
+  // keyed only on the real open/close transition, not on every re-render.
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
 
   useEffect(() => {
     if (!open) return;
@@ -38,7 +45,7 @@ export function Dialog({ open, onClose, title, description, children, className 
 
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
-        onClose();
+        onCloseRef.current();
         return;
       }
       if (e.key !== "Tab" || !panelRef.current) return;
@@ -65,7 +72,7 @@ export function Dialog({ open, onClose, title, description, children, className 
       // Restore focus to whatever opened the dialog.
       triggerRef.current?.focus();
     };
-  }, [open, onClose]);
+  }, [open]);
 
   if (!open || typeof document === "undefined") return null;
 
