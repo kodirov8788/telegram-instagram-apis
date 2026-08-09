@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from 'node:crypto';
 import type { NextRequest } from 'next/server';
 import { query, tenantTransaction, type DbClient } from '@/lib/db';
+import { createSupabaseServerClient } from '@/lib/supabase/server';
 import { can, type Permission, type Role } from './permissions';
 import { HttpError, uuid } from '../http/validation';
 
@@ -18,7 +19,28 @@ export async function createSession(userId: string, client: DbClient = { query }
   return { token, expiresAt };
 }
 
-export async function authenticate(request: NextRequest, client: DbClient = { query }): Promise<Principal> {
+/**
+ * Resolve the current Supabase Auth session, if any. Uses `getUser()` rather
+ * than `getSession()` — `getSession()` merely decodes the (unverified)
+ * cookie-borne JWT, while `getUser()` revalidates the token against
+ * Supabase's auth server, which is the trust boundary we need server-side.
+ * Per AUTH-01, `auth.users.id` equals `public.users.id`, so no extra lookup
+ * is needed to map the Supabase user onto our `Principal` shape.
+ */
+async function authenticateViaSupabase(request: NextRequest): Promise<Principal | null> {
+  if (!process.env.NEXT_PUBLIC_SUPABASE_URL || !process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY) return null;
+  try {
+    const supabase = createSupabaseServerClient(request);
+    const { data, error } = await supabase.auth.getUser();
+    if (error || !data.user || !data.user.email) return null;
+    return { userId: data.user.id, email: data.user.email };
+  } catch {
+    return null;
+  }
+}
+
+/** Legacy custom-cookie session lookup (pre-Supabase-Auth). Retained until AUTH-05. */
+async function authenticateViaLegacyCookie(request: NextRequest, client: DbClient): Promise<Principal> {
   const token = request.cookies.get(SESSION_COOKIE)?.value;
   if (!token) throw new HttpError(401, 'Authentication required');
   const result = await client.query(
@@ -27,6 +49,20 @@ export async function authenticate(request: NextRequest, client: DbClient = { qu
   const row = result.rows[0];
   if (!row) throw new HttpError(401, 'Invalid or expired session');
   return { userId: row.user_id, email: row.email };
+}
+
+/**
+ * Resolve the calling principal. Tries a Supabase Auth session first (the
+ * AUTH-02+ path); if none is present, falls back to the legacy custom-cookie
+ * `user_sessions` lookup so pre-existing (theoretical, zero-production-user)
+ * flows keep working until AUTH-05 removes them. Both paths return the same
+ * `Principal` shape, so every downstream call site (`authorize`,
+ * `withLiveAuthorization`, and every route handler) is unaffected.
+ */
+export async function authenticate(request: NextRequest, client: DbClient = { query }): Promise<Principal> {
+  const supabasePrincipal = await authenticateViaSupabase(request);
+  if (supabasePrincipal) return supabasePrincipal;
+  return authenticateViaLegacyCookie(request, client);
 }
 
 export function selectedWorkspace(request: NextRequest): string {
