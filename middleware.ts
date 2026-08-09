@@ -22,6 +22,23 @@ function isPublicPagePath(pathname: string) {
 }
 
 /**
+ * `NextResponse.redirect(url)` builds a brand-new response object — it does
+ * NOT carry over any `Set-Cookie` header the earlier `supabase.auth.getUser()`
+ * call may have written onto `response` (e.g. a rotated refresh token). Per
+ * independent review of #109: without this, a token rotation that happened
+ * on this exact request would be silently dropped on the /login and
+ * /onboarding redirect paths, leaving the client with its old, soon-to-expire
+ * cookie. Copying the header across preserves the refresh regardless of
+ * which response path this request takes.
+ */
+function redirectPreservingRefreshedCookies(url: URL, refreshedResponse: NextResponse) {
+  const redirectResponse = NextResponse.redirect(url);
+  const setCookie = refreshedResponse.headers.get('set-cookie');
+  if (setCookie) redirectResponse.headers.set('set-cookie', setCookie);
+  return redirectResponse;
+}
+
+/**
  * AUTH-04 (#87) route protection.
  *
  * Extends AUTH-02's refresh-only middleware with page-level redirects:
@@ -65,7 +82,7 @@ export async function middleware(request: NextRequest) {
     if (workspacesRes.status === 401) {
       const loginUrl = new URL('/login', request.url);
       loginUrl.searchParams.set('redirect', pathname);
-      return NextResponse.redirect(loginUrl);
+      return redirectPreservingRefreshedCookies(loginUrl, response);
     }
     if (workspacesRes.ok) {
       const data = (await workspacesRes.json()) as { workspaces: unknown[] };
@@ -80,7 +97,7 @@ export async function middleware(request: NextRequest) {
   }
 
   if (workspaceCount === 0) {
-    return NextResponse.redirect(new URL('/onboarding', request.url));
+    return redirectPreservingRefreshedCookies(new URL('/onboarding', request.url), response);
   }
 
   return response;
