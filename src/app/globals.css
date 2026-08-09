@@ -2,13 +2,39 @@
 @tailwind components;
 @tailwind utilities;
 
+/*
+ * Light-first design system tokens.
+ * This is the ONLY theme — no dark mode, no prefers-color-scheme,
+ * no `dark:` variants anywhere in this codebase. Light renders
+ * identically regardless of the OS theme setting.
+ */
 :root {
-  --background: #0f172a;
-  --foreground: #f8fafc;
+  /* Surfaces */
+  --background: #ffffff;
+  --background-subtle: #f8fafc;
+  --background-muted: #f1f5f9;
+
+  /* Text */
+  --foreground: #0f172a;
+  --foreground-muted: #475569;
+  --foreground-subtle: #94a3b8;
+
+  /* Borders */
+  --border: #e2e8f0;
+  --border-strong: #cbd5e1;
+
+  /* Radius scale */
+  --radius-sm: 0.25rem;
+  --radius-md: 0.5rem;
+  --radius-lg: 0.75rem;
+  --radius-xl: 1rem;
 }
 
 body {
   color: var(--foreground);
   background: var(--background);
-  font-family: Arial, Helvetica, sans-serif;
+}
+
+* {
+  border-color: var(--border);
 }
